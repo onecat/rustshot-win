@@ -131,7 +131,7 @@ impl Canvas<'_> {
                 for y in tile_y..end_y {
                     for x in tile_x..end_x {
                         let n = (y * self.width + x) * 4;
-                        for c in 0..3 { sum[c] += u64::from(self.pixels[n + c]); }
+                        for (c, value) in sum.iter_mut().enumerate() { *value += u64::from(self.pixels[n + c]); }
                         count += 1;
                     }
                 }
