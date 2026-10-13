@@ -445,7 +445,8 @@ fn paint_overlay(hwnd: Hwnd) {
                 let text = utf16(&title);
                 TextOutW(dc, rel.left + 2, (rel.top - 20).max(0), text.as_ptr(), text.len() as i32 - 1);
                 if state.selected.is_some() {
-                    paint_annotations(dc, frame.bounds, selection, &state.history,
+                    paint_annotations(dc, Point { x: frame.bounds.left, y: frame.bounds.top },
+                        selection, &state.history,
                         state.active_annotation.as_ref());
                     let white = CreateSolidBrush(0x00FFFFFF);
                     let green = CreatePen(PS_SOLID, 1, 0x0045C62A);
