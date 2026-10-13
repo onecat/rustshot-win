@@ -657,6 +657,7 @@ fn start_capture() {
 }
 
 fn close_overlay() {
+    cancel_text_edit();
     let hwnd = APP.with(|cell| {
         let mut s = cell.borrow_mut();
         s.frame = None;
@@ -786,6 +787,7 @@ fn save_png(width: u32, height: u32, pixels: &[u8]) -> io::Result<PathBuf> {
 }
 
 fn finish_capture() {
+    commit_text_edit();
     let picture = selected_image();
     let owner = APP.with(|s| s.borrow().main);
     close_overlay();
@@ -806,6 +808,82 @@ fn finish_capture() {
         app.writers.push(worker);
     });
     if let Err(err) = copied { alert(owner, &format!("Clipboard copy failed; PNG save will still be attempted: {err}")); }
+}
+
+
+fn start_text_edit(overlay: Hwnd) {
+    cancel_text_edit();
+    let (position, bounds) = APP.with(|cell| {
+        let state = cell.borrow();
+        let bounds = state.frame.as_ref().map(|f| f.bounds).unwrap_or_default();
+        (state.drag_anchor, bounds)
+    });
+    if bounds.width() <= 0 || bounds.height() <= 0 { return; }
+    let x = (position.x - bounds.left).clamp(0, (bounds.width() - 1).max(0));
+    let y = (position.y - bounds.top).clamp(0, (bounds.height() - 1).max(0));
+    let width = 300.min((bounds.width() - x).max(1));
+    let height = 32.min((bounds.height() - y).max(1));
+    let class = utf16("EDIT");
+    unsafe {
+        let edit = CreateWindowExW(0, class.as_ptr(), utf16("").as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            x, y, width, height, overlay, 0, GetModuleHandleW(null()), null());
+        if edit == 0 { alert(overlay, "Unable to open the text editor"); return; }
+        APP.with(|cell| {
+            let mut state = cell.borrow_mut();
+            state.text_edit = edit;
+            state.text_anchor = position;
+        });
+        SetFocus(edit);
+    }
+}
+
+fn commit_text_edit() {
+    let (edit, position, overlay) = APP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let edit = std::mem::replace(&mut state.text_edit, 0);
+        (edit, state.text_anchor, state.overlay)
+    });
+    if edit == 0 { return; }
+    let words = unsafe {
+        // Limit input to 512 UTF-16 units, preventing pathological label sizes.
+        let count = GetWindowTextLengthW(edit).clamp(0, 512) as usize;
+        let mut buffer = vec![0u16; count + 1];
+        let read = GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
+        DestroyWindow(edit);
+        String::from_utf16_lossy(&buffer[..read.max(0) as usize])
+    };
+    if !words.trim().is_empty() {
+        APP.with(|cell| cell.borrow_mut().history.push(Annotation::text_at(position, words)));
+    }
+    if overlay != 0 {
+        unsafe { SetFocus(overlay); InvalidateRect(overlay, null(), 0); }
+    }
+}
+
+fn cancel_text_edit() {
+    let (edit, overlay) = APP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        (std::mem::replace(&mut state.text_edit, 0), state.overlay)
+    });
+    if edit != 0 { unsafe { DestroyWindow(edit); } }
+    if overlay != 0 {
+        unsafe { SetFocus(overlay); InvalidateRect(overlay, null(), 0); }
+    }
+}
+
+// Called before TranslateMessage, because standard EDIT child windows own
+// WM_KEYDOWN and would otherwise consume Enter/Escape before overlay_proc.
+fn handle_text_edit_key(message: &Msg) -> bool {
+    let edit = APP.with(|cell| cell.borrow().text_edit);
+    if edit == 0 || message.hwnd != edit || message.message != WM_KEYDOWN {
+        return false;
+    }
+    match message.wparam {
+        VK_RETURN => { commit_text_edit(); true }
+        VK_ESCAPE => { cancel_text_edit(); true }
+        _ => false,
+    }
 }
 
 fn mouse_down(hwnd: Hwnd, l: Lparam) {
@@ -852,6 +930,7 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
     });
     match action {
         1..=7 => {
+            commit_text_edit();
             APP.with(|cell| {
                 cell.borrow_mut().tool = match action {
                     1 => Tool::Select, 2 => Tool::Rectangle, 3 => Tool::Ellipse,
@@ -862,10 +941,12 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
         8 => {
+            commit_text_edit();
             APP.with(|cell| { cell.borrow_mut().history.undo(); });
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
         9 => {
+            commit_text_edit();
             APP.with(|cell| { cell.borrow_mut().history.redo(); });
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
@@ -1047,6 +1128,7 @@ pub fn run() {
         ShowWindow(hwnd, SW_HIDE);
         let mut msg: Msg = zeroed();
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            if handle_text_edit_key(&msg) { continue; }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
