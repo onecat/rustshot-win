@@ -204,6 +204,6 @@ mod tests {
         let mut a = Annotation::begin(Tool::Arrow, Point { x: -99, y: -98 });
         a.update(Point { x: -91, y: -90 });
         render(&mut pixels, 16, 16, Point { x: -100, y: -100 }, &[a]);
-        assert!(pixels.chunks_exact(4).any(|p| p == RED_BGRA));
+        assert!(pixels.chunks(4).any(|p| p == RED_BGRA));
     }
 }
