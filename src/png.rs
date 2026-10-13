@@ -111,12 +111,26 @@ impl<'a, W: Write> StoredStream<'a, W> {
     }
 }
 
+const fn crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (0u32.wrapping_sub(crc & 1)));
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+}
+const CRC_TABLE: [u32; 256] = crc_table();
+
 fn update_crc(mut crc: u32, bytes: &[u8]) -> u32 {
     for &value in bytes {
-        crc ^= u32::from(value);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xEDB88320 & (0u32.wrapping_sub(crc & 1)));
-        }
+        crc = (crc >> 8) ^ CRC_TABLE[((crc ^ u32::from(value)) & 0xFF) as usize];
     }
     crc
 }
