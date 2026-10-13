@@ -217,7 +217,7 @@ fn win_rect(r: Rect) -> WinRect { WinRect { left: r.left, top: r.top, right: r.r
 fn low_word_signed(l: Lparam) -> i32 { l as u16 as i16 as i32 }
 fn high_word_signed(l: Lparam) -> i32 { (l >> 16) as u16 as i16 as i32 }
 fn black_tint(data: &mut [u8]) {
-    for p in data.chunks_exact_mut(4) {
+    for p in data.as_chunks_mut::<4>().0 {
         for color in p.iter_mut().take(3) { *color = ((*color as u16 * 145) / 255) as u8; }
     }
 }
@@ -305,9 +305,8 @@ unsafe extern "system" fn enumerate_windows_callback(hwnd: Hwnd, value: Lparam) 
         return 1;
     }
     let mut rect: WinRect = zeroed();
-    if DwmGetWindowAttribute(hwnd, 9, &mut rect as *mut _ as *mut c_void, size_of::<WinRect>() as u32) != 0 {
-        if GetWindowRect(hwnd, &mut rect) == 0 { return 1; }
-    }
+    if DwmGetWindowAttribute(hwnd, 9, &mut rect as *mut _ as *mut c_void, size_of::<WinRect>() as u32) != 0
+        && GetWindowRect(hwnd, &mut rect) == 0 { return 1; }
     let screen = Rect { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
     if screen.width() >= 30 && screen.height() >= 30 { list.push(screen); }
     1

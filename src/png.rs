@@ -25,7 +25,7 @@ pub fn encode_bgra<W: Write>(mut out: W, width: u32, height: u32, bgra: &[u8]) -
     let mut raw = Vec::with_capacity(total);
     for row in bgra.chunks_exact(width as usize * 4) {
         raw.push(0);
-        for px in row.chunks_exact(4) {
+        for px in row.as_chunks::<4>().0 {
             raw.extend_from_slice(&[px[2], px[1], px[0]]);
         }
     }
