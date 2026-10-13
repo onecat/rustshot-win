@@ -1,6 +1,8 @@
 //! Minimal native Win32/GDI baseline for the first screenshot PoC.
 //! No external crates; unsafe FFI calls are isolated here. Windows 11 validation is pending.
+use crate::annotations::{self, Annotation, History, Tool};
 use crate::geometry::{Point, Rect};
+use crate::selection::Handle as ResizeHandle;
 use crate::png;
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -42,6 +44,9 @@ const WM_CONTEXTMENU: u32 = 0x007B;
 const WM_APP_TRAY: u32 = 0x8000 + 12;
 const VK_ESCAPE: usize = 27;
 const VK_RETURN: usize = 13;
+const VK_CONTROL: i32 = 17;
+const VK_Z: usize = 0x5A;
+const VK_Y: usize = 0x59;
 const MOD_ALT: u32 = 0x0001;
 const MOD_CONTROL: u32 = 0x0002;
 const MOD_SHIFT: u32 = 0x0004;
@@ -150,6 +155,7 @@ extern "system" {
     fn SetCapture(hwnd: Hwnd) -> Hwnd;
     fn ReleaseCapture() -> i32;
     fn SetFocus(hwnd: Hwnd) -> Hwnd;
+    fn GetKeyState(key: i32) -> i16;
     fn EnumWindows(cb: Option<unsafe extern "system" fn(Hwnd, Lparam) -> i32>, lparam: Lparam) -> i32;
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
     fn IsIconic(hwnd: Hwnd) -> i32;
@@ -181,6 +187,12 @@ extern "system" {
     fn CreatePen(style: i32, width: i32, color: u32) -> Hobj;
     fn GetStockObject(index: i32) -> Hobj;
     fn Rectangle(dc: Hdc, l: i32, t: i32, r: i32, b: i32) -> i32;
+    fn Ellipse(dc: Hdc, l: i32, t: i32, r: i32, b: i32) -> i32;
+    fn MoveToEx(dc: Hdc, x: i32, y: i32, previous: *mut WinPoint) -> i32;
+    fn LineTo(dc: Hdc, x: i32, y: i32) -> i32;
+    fn SaveDC(dc: Hdc) -> i32;
+    fn RestoreDC(dc: Hdc, saved: i32) -> i32;
+    fn IntersectClipRect(dc: Hdc, left: i32, top: i32, right: i32, bottom: i32) -> i32;
     fn CreateSolidBrush(color: u32) -> Hobj;
     fn SetTextColor(dc: Hdc, color: u32) -> u32;
     fn SetBkMode(dc: Hdc, mode: i32) -> i32;
@@ -238,6 +250,10 @@ struct AppState {
     selected: Option<Rect>,
     dragging: bool,
     moving: bool,
+    resizing: Option<ResizeHandle>,
+    active_annotation: Option<Annotation>,
+    tool: Tool,
+    history: History,
     drag_anchor: Point,
     drag_initial: Rect,
     fallback_hotkey: bool,
@@ -246,7 +262,8 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
-            dragging: false, moving: false, drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, writers: Vec::new() }
+            dragging: false, moving: false, resizing: None, active_annotation: None,
+            tool: Tool::Select, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, writers: Vec::new() }
     }
 }
 thread_local! { static APP: RefCell<AppState> = RefCell::new(AppState::new()); }
@@ -325,12 +342,75 @@ fn local_pos(frame: &Frame, l: Lparam) -> Point {
     Point { x: frame.bounds.left + low_word_signed(l), y: frame.bounds.top + high_word_signed(l) }
 }
 fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
-    let width = 190.min(bounds.width().max(1));
+    let width = 540.min(bounds.width().max(1));
     let height = 34.min(bounds.height().max(1));
     let x = (selection.right - width).clamp(bounds.left, bounds.right - width);
     let proposed = selection.bottom + 7;
     let y = if proposed + height <= bounds.bottom { proposed } else { (selection.top - 7 - height).max(bounds.top) };
     Rect { left: x, top: y, right: x + width, bottom: y + height }
+}
+
+// Preview uses GDI for low allocation while editing. Export uses the same vector
+// records rendered into an independent BGRA crop in annotations::render.
+unsafe fn preview_annotation(dc: Hdc, a: &Annotation, origin: Point) {
+    if a.points.len() < 2 { return; }
+    let first = a.points[0];
+    let last = *a.points.last().unwrap_or(&first);
+    let to_local = |p: Point| Point { x: p.x - origin.x, y: p.y - origin.y };
+    let line = |from: Point, to: Point| {
+        let start = to_local(from);
+        let end = to_local(to);
+        MoveToEx(dc, start.x, start.y, null_mut());
+        LineTo(dc, end.x, end.y);
+    };
+    match a.tool {
+        Tool::Rectangle => {
+            let x = first.x.min(last.x) - origin.x;
+            let y = first.y.min(last.y) - origin.y;
+            let right = first.x.max(last.x) - origin.x;
+            let bottom = first.y.max(last.y) - origin.y;
+            Rectangle(dc, x, y, right, bottom);
+        }
+        Tool::Ellipse => {
+            Ellipse(dc, first.x.min(last.x) - origin.x, first.y.min(last.y) - origin.y,
+                first.x.max(last.x) - origin.x, first.y.max(last.y) - origin.y);
+        }
+        Tool::Arrow => {
+            line(first, last);
+            let angle = f64::from(last.y - first.y).atan2(f64::from(last.x - first.x));
+            for sign in [-1.0_f64, 1.0] {
+                let theta = angle + std::f64::consts::PI + sign * 0.52;
+                let tip = Point { x: (f64::from(last.x) + 16.0 * theta.cos()) as i32,
+                    y: (f64::from(last.y) + 16.0 * theta.sin()) as i32 };
+                line(last, tip);
+            }
+        }
+        Tool::Pen => {
+            for segment in a.points.windows(2) { line(segment[0], segment[1]); }
+        }
+        Tool::Select => {}
+    }
+}
+
+fn paint_annotations(dc: Hdc, origin: Point, selection: Rect, history: &History,
+    current: Option<&Annotation>) {
+    unsafe {
+        let saved = SaveDC(dc);
+        if saved == 0 { return; }
+        let area = selection.translated(-origin.x, -origin.y);
+        IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
+        let pen = CreatePen(PS_SOLID, 3, 0x00E83027);
+        if pen != 0 {
+            let old_pen = SelectObject(dc, pen);
+            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            for a in &history.committed { preview_annotation(dc, a, origin); }
+            if let Some(a) = current { preview_annotation(dc, a, origin); }
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            DeleteObject(pen);
+        }
+        RestoreDC(dc, saved);
+    }
 }
 
 fn paint_overlay(hwnd: Hwnd) {
@@ -365,16 +445,54 @@ fn paint_overlay(hwnd: Hwnd) {
                 let text = utf16(&title);
                 TextOutW(dc, rel.left + 2, (rel.top - 20).max(0), text.as_ptr(), text.len() as i32 - 1);
                 if state.selected.is_some() {
+                    paint_annotations(dc, Point { x: frame.bounds.left, y: frame.bounds.top },
+                        selection, &state.history,
+                        state.active_annotation.as_ref());
+                    let white = CreateSolidBrush(0x00FFFFFF);
+                    let green = CreatePen(PS_SOLID, 1, 0x0045C62A);
+                    if white != 0 && green != 0 {
+                        let old_pen = SelectObject(dc, green);
+                        for handle in ResizeHandle::ALL {
+                            let center = handle.center(selection);
+                            let x = center.x - frame.bounds.left;
+                            let y = center.y - frame.bounds.top;
+                            let square = WinRect { left: x - 4, top: y - 4, right: x + 5, bottom: y + 5 };
+                            FillRect(dc, &square, white);
+                            Rectangle(dc, square.left, square.top, square.right, square.bottom);
+                        }
+                        SelectObject(dc, old_pen);
+                    }
+                    if white != 0 { DeleteObject(white); }
+                    if green != 0 { DeleteObject(green); }
+
                     let bar = toolbar_for(selection, frame.bounds).translated(-frame.bounds.left, -frame.bounds.top);
                     let background = CreateSolidBrush(0x00FAFAFA);
-                    FillRect(dc, &win_rect(bar), background);
-                    DeleteObject(background);
-                    SetTextColor(dc, 0x002A9B21);
-                    let accept = utf16("Enter / ✓ 完成");
-                    TextOutW(dc, bar.left + 8, bar.top + 8, accept.as_ptr(), accept.len() as i32 - 1);
-                    SetTextColor(dc, 0x00555555);
-                    let cancel = utf16("Esc / × 取消");
-                    TextOutW(dc, bar.left + 104, bar.top + 8, cancel.as_ptr(), cancel.len() as i32 - 1);
+                    if background != 0 {
+                        FillRect(dc, &win_rect(bar), background);
+                        DeleteObject(background);
+                    }
+                    let labels = [
+                        Tool::LABELS[0], Tool::LABELS[1], Tool::LABELS[2],
+                        Tool::LABELS[3], Tool::LABELS[4], "撤销", "重做", "完成", "取消",
+                    ];
+                    SetBkMode(dc, TRANSPARENT);
+                    for (index, label) in labels.iter().enumerate() {
+                        let left = bar.left + index as i32 * bar.width() / 9;
+                        let right = bar.left + (index as i32 + 1) * bar.width() / 9;
+                        if index < 5 && state.tool == [
+                            Tool::Select, Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Pen
+                        ][index] {
+                            let brush = CreateSolidBrush(0x00D5F4E4);
+                            if brush != 0 {
+                                FillRect(dc, &WinRect { left, top: bar.top, right,
+                                    bottom: bar.bottom }, brush);
+                                DeleteObject(brush);
+                            }
+                        }
+                        SetTextColor(dc, if index == 7 { 0x002A9B21 } else { 0x00555555 });
+                        let glyphs = utf16(label);
+                        TextOutW(dc, left + 5, bar.top + 9, glyphs.as_ptr(), glyphs.len() as i32 - 1);
+                    }
                 }
             }
         });
@@ -421,6 +539,10 @@ fn close_overlay() {
         s.hover = None;
         s.dragging = false;
         s.moving = false;
+        s.resizing = None;
+        s.active_annotation = None;
+        s.tool = Tool::Select;
+        s.history.clear();
         std::mem::replace(&mut s.overlay, 0)
     });
     if hwnd != 0 { unsafe { ReleaseCapture(); DestroyWindow(hwnd); } }
@@ -439,6 +561,8 @@ fn selected_image() -> Option<(u32, u32, Vec<u8>)> {
             let offset = (y * frame.bounds.width() as usize + left) * 4;
             crop.extend_from_slice(&frame.pixels[offset..offset + rect.width() as usize * 4]);
         }
+        annotations::render(&mut crop, rect.width() as u32, rect.height() as u32,
+            Point { x: rect.left, y: rect.top }, &state.history.committed);
         Some((rect.width() as u32, rect.height() as u32, crop))
     })
 }
@@ -552,31 +676,66 @@ fn finish_capture() {
 }
 
 fn mouse_down(hwnd: Hwnd, l: Lparam) {
-    let toolbar_action = APP.with(|cell| {
+    let action = APP.with(|cell| {
         let mut state = cell.borrow_mut();
-        let Some(frame) = &state.frame else { return 0; };
+        let Some(frame) = &state.frame else { return 0usize; };
         let point = local_pos(frame, l);
-        if let Some(selected) = state.selected {
-            let bar = toolbar_for(selected, frame.bounds);
-            if bar.contains(point) { return if point.x < bar.left + 97 { 1 } else { 2 }; }
-        }
-        state.drag_anchor = point;
+        let bounds = frame.bounds;
         if let Some(selection) = state.selected {
-            if selection.contains(point) {
-                state.moving = true;
+            let bar = toolbar_for(selection, bounds);
+            if bar.contains(point) {
+                return ((i64::from(point.x - bar.left) * 9 / i64::from(bar.width())) as usize)
+                    .min(8) + 1;
+            }
+        }
+
+        state.drag_anchor = point;
+        state.resizing = None;
+        state.moving = false;
+        if let Some(selection) = state.selected {
+            if let Some(handle) = ResizeHandle::hit_test(selection, point) {
+                state.resizing = Some(handle);
                 state.drag_initial = selection;
+                state.history.clear();
+                state.tool = Tool::Select;
+            } else if selection.contains(point) {
+                if state.tool == Tool::Select {
+                    state.moving = true;
+                    state.drag_initial = selection;
+                    state.history.clear();
+                } else {
+                    state.active_annotation = Some(Annotation::begin(state.tool, point));
+                }
             } else {
                 state.selected = None;
-                state.moving = false;
+                state.history.clear();
+                state.tool = Tool::Select;
             }
         }
         state.dragging = true;
         0
     });
-    match toolbar_action {
-        1 => finish_capture(),
-        2 => close_overlay(),
-        _ => unsafe { SetCapture(hwnd); },
+    match action {
+        1..=5 => {
+            APP.with(|cell| {
+                cell.borrow_mut().tool = match action {
+                    1 => Tool::Select, 2 => Tool::Rectangle, 3 => Tool::Ellipse,
+                    4 => Tool::Arrow, _ => Tool::Pen,
+                };
+            });
+            unsafe { InvalidateRect(hwnd, null(), 0); }
+        }
+        6 => {
+            APP.with(|cell| { cell.borrow_mut().history.undo(); });
+            unsafe { InvalidateRect(hwnd, null(), 0); }
+        }
+        7 => {
+            APP.with(|cell| { cell.borrow_mut().history.redo(); });
+            unsafe { InvalidateRect(hwnd, null(), 0); }
+        }
+        8 => finish_capture(),
+        9 => close_overlay(),
+        _ => { unsafe { SetCapture(hwnd); } }
     }
 }
 
@@ -587,8 +746,14 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
         let point = local_pos(frame, l);
         let bounds = frame.bounds;
         if s.dragging {
-            if s.moving {
-                s.selected = Some(s.drag_initial.translated(point.x - s.drag_anchor.x, point.y - s.drag_anchor.y).clamp_inside(bounds));
+            if let Some(annotation) = &mut s.active_annotation {
+                annotation.update(point);
+            } else if let Some(handle) = s.resizing {
+                s.selected = Some(handle.resize(s.drag_initial, point, bounds));
+            } else if s.moving {
+                s.selected = Some(s.drag_initial.translated(
+                    point.x - s.drag_anchor.x, point.y - s.drag_anchor.y
+                ).clamp_inside(bounds));
             } else {
                 s.selected = Rect::from_points(s.drag_anchor, point).intersection(bounds);
             }
@@ -604,11 +769,17 @@ fn mouse_up(hwnd: Hwnd, l: Lparam) {
         let mut s = cell.borrow_mut();
         if !s.dragging { return; }
         s.dragging = false;
+        let adjusting = s.moving || s.resizing.is_some();
         s.moving = false;
-        let Some(frame) = &s.frame else { return; };
-        let point = local_pos(frame, l);
-        if s.selected.map(|r| r.width() < 4 || r.height() < 4).unwrap_or(true) {
-            s.selected = hit_test(frame, point);
+        s.resizing = None;
+        if let Some(annotation) = s.active_annotation.take() {
+            s.history.push(annotation);
+        } else if !adjusting {
+            let Some(frame) = &s.frame else { return; };
+            let point = local_pos(frame, l);
+            if s.selected.map(|r| r.width() < 4 || r.height() < 4).unwrap_or(true) {
+                s.selected = hit_test(frame, point);
+            }
         }
     });
     unsafe { ReleaseCapture(); InvalidateRect(hwnd, null(), 0); }
@@ -621,6 +792,14 @@ unsafe extern "system" fn overlay_proc(hwnd: Hwnd, message: u32, w: Wparam, l: L
         WM_LBUTTONDOWN => { mouse_down(hwnd, l); 0 }
         WM_LBUTTONUP => { mouse_up(hwnd, l); 0 }
         WM_KEYDOWN if w == VK_RETURN => { finish_capture(); 0 }
+        WM_KEYDOWN if (w == VK_Z || w == VK_Y) && GetKeyState(VK_CONTROL) < 0 => {
+            APP.with(|cell| {
+                if w == VK_Z { cell.borrow_mut().history.undo(); }
+                else { cell.borrow_mut().history.redo(); }
+            });
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
         WM_KEYDOWN if w == VK_ESCAPE => { close_overlay(); 0 }
         WM_RBUTTONUP | WM_CLOSE | WM_DISPLAYCHANGE => { close_overlay(); 0 }
         _ => DefWindowProcW(hwnd, message, w, l),
