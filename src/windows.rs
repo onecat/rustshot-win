@@ -350,6 +350,69 @@ fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
     Rect { left: x, top: y, right: x + width, bottom: y + height }
 }
 
+// Preview uses GDI for low allocation while editing. Export uses the same vector
+// records rendered into an independent BGRA crop in annotations::render.
+unsafe fn preview_annotation(dc: Hdc, a: &Annotation, origin: Point) {
+    if a.points.len() < 2 { return; }
+    let first = a.points[0];
+    let last = *a.points.last().unwrap_or(&first);
+    let to_local = |p: Point| Point { x: p.x - origin.x, y: p.y - origin.y };
+    let line = |from: Point, to: Point| {
+        let start = to_local(from);
+        let end = to_local(to);
+        MoveToEx(dc, start.x, start.y, null_mut());
+        LineTo(dc, end.x, end.y);
+    };
+    match a.tool {
+        Tool::Rectangle => {
+            let x = first.x.min(last.x) - origin.x;
+            let y = first.y.min(last.y) - origin.y;
+            let right = first.x.max(last.x) - origin.x;
+            let bottom = first.y.max(last.y) - origin.y;
+            Rectangle(dc, x, y, right, bottom);
+        }
+        Tool::Ellipse => {
+            Ellipse(dc, first.x.min(last.x) - origin.x, first.y.min(last.y) - origin.y,
+                first.x.max(last.x) - origin.x, first.y.max(last.y) - origin.y);
+        }
+        Tool::Arrow => {
+            line(first, last);
+            let angle = f64::from(last.y - first.y).atan2(f64::from(last.x - first.x));
+            for sign in [-1.0_f64, 1.0] {
+                let theta = angle + std::f64::consts::PI + sign * 0.52;
+                let tip = Point { x: (f64::from(last.x) + 16.0 * theta.cos()) as i32,
+                    y: (f64::from(last.y) + 16.0 * theta.sin()) as i32 };
+                line(last, tip);
+            }
+        }
+        Tool::Pen => {
+            for segment in a.points.windows(2) { line(segment[0], segment[1]); }
+        }
+        Tool::Select => {}
+    }
+}
+
+fn paint_annotations(dc: Hdc, origin: Point, selection: Rect, history: &History,
+    current: Option<&Annotation>) {
+    unsafe {
+        let saved = SaveDC(dc);
+        if saved == 0 { return; }
+        let area = selection.translated(-origin.x, -origin.y);
+        IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
+        let pen = CreatePen(PS_SOLID, 3, 0x00E83027);
+        if pen != 0 {
+            let old_pen = SelectObject(dc, pen);
+            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            for a in &history.committed { preview_annotation(dc, a, origin); }
+            if let Some(a) = current { preview_annotation(dc, a, origin); }
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            DeleteObject(pen);
+        }
+        RestoreDC(dc, saved);
+    }
+}
+
 fn paint_overlay(hwnd: Hwnd) {
     // SAFETY: BeginPaint/EndPaint are paired; HDC is only used inside the paint call.
     unsafe {
@@ -382,16 +445,53 @@ fn paint_overlay(hwnd: Hwnd) {
                 let text = utf16(&title);
                 TextOutW(dc, rel.left + 2, (rel.top - 20).max(0), text.as_ptr(), text.len() as i32 - 1);
                 if state.selected.is_some() {
+                    paint_annotations(dc, frame.bounds, selection, &state.history,
+                        state.active_annotation.as_ref());
+                    let white = CreateSolidBrush(0x00FFFFFF);
+                    let green = CreatePen(PS_SOLID, 1, 0x0045C62A);
+                    if white != 0 && green != 0 {
+                        let old_pen = SelectObject(dc, green);
+                        for handle in ResizeHandle::ALL {
+                            let center = handle.center(selection);
+                            let x = center.x - frame.bounds.left;
+                            let y = center.y - frame.bounds.top;
+                            let square = WinRect { left: x - 4, top: y - 4, right: x + 5, bottom: y + 5 };
+                            FillRect(dc, &square, white);
+                            Rectangle(dc, square.left, square.top, square.right, square.bottom);
+                        }
+                        SelectObject(dc, old_pen);
+                    }
+                    if white != 0 { DeleteObject(white); }
+                    if green != 0 { DeleteObject(green); }
+
                     let bar = toolbar_for(selection, frame.bounds).translated(-frame.bounds.left, -frame.bounds.top);
                     let background = CreateSolidBrush(0x00FAFAFA);
-                    FillRect(dc, &win_rect(bar), background);
-                    DeleteObject(background);
-                    SetTextColor(dc, 0x002A9B21);
-                    let accept = utf16("Enter / ✓ 完成");
-                    TextOutW(dc, bar.left + 8, bar.top + 8, accept.as_ptr(), accept.len() as i32 - 1);
-                    SetTextColor(dc, 0x00555555);
-                    let cancel = utf16("Esc / × 取消");
-                    TextOutW(dc, bar.left + 104, bar.top + 8, cancel.as_ptr(), cancel.len() as i32 - 1);
+                    if background != 0 {
+                        FillRect(dc, &win_rect(bar), background);
+                        DeleteObject(background);
+                    }
+                    let labels = [
+                        Tool::LABELS[0], Tool::LABELS[1], Tool::LABELS[2],
+                        Tool::LABELS[3], Tool::LABELS[4], "撤销", "重做", "完成", "取消",
+                    ];
+                    SetBkMode(dc, TRANSPARENT);
+                    for (index, label) in labels.iter().enumerate() {
+                        let left = bar.left + index as i32 * bar.width() / 9;
+                        let right = bar.left + (index as i32 + 1) * bar.width() / 9;
+                        if index < 5 && state.tool == [
+                            Tool::Select, Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Pen
+                        ][index] {
+                            let brush = CreateSolidBrush(0x00D5F4E4);
+                            if brush != 0 {
+                                FillRect(dc, &WinRect { left, top: bar.top, right,
+                                    bottom: bar.bottom }, brush);
+                                DeleteObject(brush);
+                            }
+                        }
+                        SetTextColor(dc, if index == 7 { 0x002A9B21 } else { 0x00555555 });
+                        let glyphs = utf16(label);
+                        TextOutW(dc, left + 5, bar.top + 9, glyphs.as_ptr(), glyphs.len() as i32 - 1);
+                    }
                 }
             }
         });
