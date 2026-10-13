@@ -210,6 +210,7 @@ extern "system" {
     fn SetTextColor(dc: Hdc, color: u32) -> u32;
     fn SetBkMode(dc: Hdc, mode: i32) -> i32;
     fn TextOutW(dc: Hdc, x: i32, y: i32, text: *const u16, len: i32) -> i32;
+    fn GdiFlush() -> i32;
     fn CreateFontW(height: i32, width: i32, escapement: i32, orientation: i32,
         weight: i32, italic: u32, underline: u32, strikeout: u32, charset: u32,
         output_precision: u32, clip_precision: u32, quality: u32, pitch_family: u32,
@@ -419,12 +420,20 @@ unsafe fn preview_annotation(dc: Hdc, a: &Annotation, origin: Point) {
         Tool::Pen => {
             for segment in a.points.windows(2) { line(segment[0], segment[1]); }
         }
-        Tool::Select => {}
+        Tool::Text => {
+            let words = utf16(&a.text);
+            if words.len() > 1 {
+                TextOutW(dc, first.x - origin.x, first.y - origin.y,
+                    words.as_ptr(), words.len() as i32 - 1);
+            }
+        }
+        Tool::Mosaic | Tool::Select => {}
     }
 }
 
-fn paint_annotations(dc: Hdc, origin: Point, selection: Rect, history: &History,
+fn paint_annotations(dc: Hdc, frame: &Frame, selection: Rect, history: &History,
     current: Option<&Annotation>) {
+    let origin = Point { x: frame.bounds.left, y: frame.bounds.top };
     unsafe {
         let saved = SaveDC(dc);
         if saved == 0 { return; }
@@ -434,14 +443,97 @@ fn paint_annotations(dc: Hdc, origin: Point, selection: Rect, history: &History,
         if pen != 0 {
             let old_pen = SelectObject(dc, pen);
             let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            for a in &history.committed { preview_annotation(dc, a, origin); }
-            if let Some(a) = current { preview_annotation(dc, a, origin); }
+            let font = create_annotation_font();
+            let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, 0x002730E8);
+            for a in history.committed.iter().chain(current) {
+                if a.tool == Tool::Mosaic { preview_mosaic(dc, frame, selection, a); }
+                else { preview_annotation(dc, a, origin); }
+            }
+            if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
             SelectObject(dc, old_brush);
             SelectObject(dc, old_pen);
             DeleteObject(pen);
         }
         RestoreDC(dc, saved);
     }
+}
+
+
+fn create_annotation_font() -> Hobj {
+    let face = utf16("Microsoft YaHei UI");
+    unsafe {
+        CreateFontW(22, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, face.as_ptr())
+    }
+}
+
+// Render text into the pixel buffer used for both clipboard and PNG. Keep
+// non-text raster operations before/after each label in original history order.
+fn render_text_to_pixels(pixels: &mut [u8], width: u32, height: u32,
+    origin: Point, annotation: &Annotation) {
+    if annotation.tool != Tool::Text || annotation.text.is_empty() ||
+        width == 0 || height == 0 || width > i32::MAX as u32 ||
+        height > i32::MAX as u32 { return; }
+    unsafe {
+        let screen = GetDC(0);
+        if screen == 0 { return; }
+        let dc = CreateCompatibleDC(screen);
+        if dc == 0 { ReleaseDC(0, screen); return; }
+        let mut bits: *mut c_void = null_mut();
+        let info = bitmap_info(width as i32, height as i32);
+        let bmp = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, 0, 0);
+        if bmp == 0 || bits.is_null() {
+            if bmp != 0 { DeleteObject(bmp); }
+            DeleteDC(dc);
+            ReleaseDC(0, screen);
+            return;
+        }
+        let old_bmp = SelectObject(dc, bmp);
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
+        let font = create_annotation_font();
+        let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, 0x002730E8);
+        let string = utf16(&annotation.text);
+        let position = annotation.points[0];
+        TextOutW(dc, position.x - origin.x, position.y - origin.y,
+            string.as_ptr(), string.len() as i32 - 1);
+        GdiFlush();
+        std::ptr::copy_nonoverlapping(bits as *const u8, pixels.as_mut_ptr(), pixels.len());
+        if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
+        if old_bmp != 0 { SelectObject(dc, old_bmp); }
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        ReleaseDC(0, screen);
+    }
+}
+
+// Draw the exact pixel blocks from the captured frame, not an ornamental
+// checkerboard. Use small temporary buffers only for the obscured region.
+unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect, a: &Annotation) {
+    if a.points.len() < 2 { return; }
+    let clipped = Rect::from_points(a.points[0], a.points[1])
+        .intersection(selection)
+        .and_then(|r| r.intersection(frame.bounds));
+    let Some(rect) = clipped else { return; };
+    let w = rect.width() as usize;
+    let h = rect.height() as usize;
+    let Some(bytes) = w.checked_mul(h).and_then(|v| v.checked_mul(4)) else { return; };
+    if bytes == 0 || bytes > MAX_CAPTURE_BYTES { return; }
+    let mut crop = Vec::with_capacity(bytes);
+    for y in 0..h {
+        let frame_y = (rect.top - frame.bounds.top) as usize + y;
+        let frame_x = (rect.left - frame.bounds.left) as usize;
+        let offset = (frame_y * frame.bounds.width() as usize + frame_x) * 4;
+        crop.extend_from_slice(&frame.pixels[offset..offset + w * 4]);
+    }
+    annotations::render(&mut crop, w as u32, h as u32,
+        Point { x: rect.left, y: rect.top }, std::slice::from_ref(a));
+    let info = bitmap_info(rect.width(), rect.height());
+    StretchDIBits(dc, rect.left - frame.bounds.left, rect.top - frame.bounds.top,
+        rect.width(), rect.height(), 0, 0, rect.width(), rect.height(),
+        crop.as_ptr() as *const c_void, &info, DIB_RGB_COLORS, SRCCOPY);
 }
 
 fn paint_overlay(hwnd: Hwnd) {
@@ -476,7 +568,7 @@ fn paint_overlay(hwnd: Hwnd) {
                 let text = utf16(&title);
                 TextOutW(dc, rel.left + 2, (rel.top - 20).max(0), text.as_ptr(), text.len() as i32 - 1);
                 if state.selected.is_some() {
-                    paint_annotations(dc, Point { x: frame.bounds.left, y: frame.bounds.top },
+                    paint_annotations(dc, frame,
                         selection, &state.history,
                         state.active_annotation.as_ref());
                     let white = CreateSolidBrush(0x00FFFFFF);
@@ -595,8 +687,15 @@ fn selected_image() -> Option<(u32, u32, Vec<u8>)> {
             let offset = (y * frame.bounds.width() as usize + left) * 4;
             crop.extend_from_slice(&frame.pixels[offset..offset + rect.width() as usize * 4]);
         }
-        annotations::render(&mut crop, rect.width() as u32, rect.height() as u32,
-            Point { x: rect.left, y: rect.top }, &state.history.committed);
+        for a in &state.history.committed {
+            if a.tool == Tool::Text {
+                render_text_to_pixels(&mut crop, rect.width() as u32, rect.height() as u32,
+                    Point { x: rect.left, y: rect.top }, a);
+            } else {
+                annotations::render(&mut crop, rect.width() as u32, rect.height() as u32,
+                    Point { x: rect.left, y: rect.top }, std::slice::from_ref(a));
+            }
+        }
         Some((rect.width() as u32, rect.height() as u32, crop))
     })
 }
