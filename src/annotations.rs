@@ -9,21 +9,27 @@ pub enum Tool {
     Ellipse,
     Arrow,
     Pen,
+    Text,
+    Mosaic,
 }
 
 impl Tool {
-    pub const LABELS: [&'static str; 5] = ["选区", "矩形", "椭圆", "箭头", "画笔"];
+    pub const LABELS: [&'static str; 7] = ["选区", "矩形", "椭圆", "箭头", "画笔", "文字", "马赛克"];
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Annotation {
     pub tool: Tool,
     pub points: Vec<Point>,
+    pub text: String,
 }
 
 impl Annotation {
     pub fn begin(tool: Tool, point: Point) -> Self {
-        Self { tool, points: vec![point, point] }
+        Self { tool, points: vec![point, point], text: String::new() }
+    }
+    pub fn text_at(point: Point, text: String) -> Self {
+        Self { tool: Tool::Text, points: vec![point], text }
     }
     pub fn update(&mut self, point: Point) {
         if self.tool == Tool::Pen {
@@ -33,7 +39,9 @@ impl Annotation {
         }
     }
     pub fn meaningful(&self) -> bool {
-        if self.tool == Tool::Pen {
+        if self.tool == Tool::Text {
+            !self.text.trim().is_empty() && !self.points.is_empty()
+        } else if self.tool == Tool::Pen {
             self.points.len() > 2
         } else {
             self.points.len() >= 2
@@ -99,6 +107,44 @@ impl Canvas<'_> {
     fn thick_dot(&mut self, x: i32, y: i32) {
         for oy in -1..=1 {
             for ox in -1..=1 { self.dot(x.saturating_add(ox), y.saturating_add(oy)); }
+        }
+    }
+
+    // Pixelate a clipped rectangle in fixed-size blocks. Each tile is confined
+    // to the annotation bounds; never leak obscured content through the edge.
+    fn mosaic(&mut self, a: Point, b: Point) {
+        let left = (i64::from(a.x.min(b.x)) - i64::from(self.origin.x))
+            .clamp(0, self.width as i64) as usize;
+        let right = (i64::from(a.x.max(b.x)) - i64::from(self.origin.x))
+            .clamp(0, self.width as i64) as usize;
+        let top = (i64::from(a.y.min(b.y)) - i64::from(self.origin.y))
+            .clamp(0, self.height as i64) as usize;
+        let bottom = (i64::from(a.y.max(b.y)) - i64::from(self.origin.y))
+            .clamp(0, self.height as i64) as usize;
+        const BLOCK: usize = 12;
+        for tile_y in (top..bottom).step_by(BLOCK) {
+            for tile_x in (left..right).step_by(BLOCK) {
+                let end_y = (tile_y + BLOCK).min(bottom);
+                let end_x = (tile_x + BLOCK).min(right);
+                let mut sum = [0u64; 3];
+                let mut count = 0u64;
+                for y in tile_y..end_y {
+                    for x in tile_x..end_x {
+                        let n = (y * self.width + x) * 4;
+                        for c in 0..3 { sum[c] += u64::from(self.pixels[n + c]); }
+                        count += 1;
+                    }
+                }
+                if count == 0 { continue; }
+                let avg = [(sum[0] / count) as u8, (sum[1] / count) as u8,
+                           (sum[2] / count) as u8];
+                for y in tile_y..end_y {
+                    for x in tile_x..end_x {
+                        let n = (y * self.width + x) * 4;
+                        self.pixels[n..n + 3].copy_from_slice(&avg);
+                    }
+                }
+            }
         }
     }
 
@@ -172,7 +218,8 @@ pub fn render(
             Tool::Pen => {
                 for pair in annotation.points.windows(2) { canvas.line(pair[0], pair[1]); }
             }
-            Tool::Select => {}
+            Tool::Mosaic => canvas.mosaic(a, b),
+            Tool::Select | Tool::Text => {}
         }
     }
 }
@@ -194,7 +241,7 @@ mod tests {
         assert!(h.undo());
         h.push(Annotation { tool: Tool::Pen, points: vec![
             Point { x: 0, y: 0 }, Point { x: 1, y: 1 }, Point { x: 2, y: 2 },
-        ] });
+        ], text: String::new() });
         assert!(!h.redo());
     }
 
@@ -206,4 +253,34 @@ mod tests {
         render(&mut pixels, 16, 16, Point { x: -100, y: -100 }, &[a]);
         assert!(pixels.chunks(4).any(|p| p == RED_BGRA));
     }
+    #[test]
+    fn mosaic_changes_only_region_and_keeps_other_pixels() {
+        let mut pixels = vec![0u8; 6 * 6 * 4];
+        for y in 0..6usize {
+            for x in 0..6usize {
+                let p = (y * 6 + x) * 4;
+                pixels[p..p+4].copy_from_slice(&[(x*31) as u8, (y*21) as u8, 100, 255]);
+            }
+        }
+        let original = pixels.clone();
+        let mut a = Annotation::begin(Tool::Mosaic, Point {x: -12, y: -6});
+        a.update(Point {x: -10, y: -4});
+        render(&mut pixels, 6, 6, Point {x: -12, y: -6}, &[a]);
+        assert_ne!(&pixels[0..3], &original[0..3]);
+        assert_eq!(&pixels[(5*6+5)*4..], &original[(5*6+5)*4..]);
+    }
+    #[test]
+    fn text_history_supports_chinese_ime_content() {
+        let mut history = History::default();
+        let annotation = Annotation::text_at(Point{x:-40,y:30}, "截图 文字 ✓".into());
+        assert!(annotation.meaningful());
+        history.push(annotation.clone());
+        assert_eq!(history.committed[0].text, "截图 文字 ✓");
+        assert!(history.undo());
+        assert!(history.redo());
+        assert_eq!(history.committed[0], annotation);
+        history.push(Annotation::text_at(Point {x:0,y:0}, " ".into()));
+        assert_eq!(history.committed.len(), 1);
+    }
+
 }
