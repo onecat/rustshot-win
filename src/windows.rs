@@ -32,7 +32,6 @@ const WS_EX_TOOLWINDOW: u32 = 0x00000080;
 const SW_SHOW: i32 = 5;
 const SW_HIDE: i32 = 0;
 const WM_DESTROY: u32 = 0x0002;
-const WM_CHAR: u32 = 0x0102;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
@@ -1083,9 +1082,9 @@ fn startup_enabled() -> Result<bool, String> {
     };
     unsafe { RegCloseKey(key); }
     if code != 0 || value_type != REG_SZ || bytes as usize > data.len() ||
-        bytes % 2 != 0 { return Ok(false); }
-    let stored: Vec<u16> = data[..bytes as usize].chunks_exact(2)
-        .map(|v| u16::from_le_bytes([v[0], v[1]])).collect();
+        !bytes.is_multiple_of(2) { return Ok(false); }
+    let stored: Vec<u16> = data[..bytes as usize].as_chunks::<2>().0.iter()
+        .map(|v| u16::from_le_bytes(*v)).collect();
     Ok(stored == expected)
 }
 
