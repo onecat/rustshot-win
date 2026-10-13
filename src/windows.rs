@@ -36,6 +36,8 @@ const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_KEYDOWN: u32 = 0x0100;
+const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
+const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
 const WS_BORDER: u32 = 0x00800000;
@@ -283,6 +285,7 @@ struct AppState {
     active_annotation: Option<Annotation>,
     text_edit: Hwnd,
     text_anchor: Point,
+    ime_composing: bool,
     tool: Tool,
     history: History,
     drag_anchor: Point,
@@ -294,6 +297,7 @@ impl AppState {
     fn new() -> Self {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
             dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
+            ime_composing: false,
             tool: Tool::Select, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, writers: Vec::new() }
     }
 }
@@ -667,6 +671,7 @@ fn close_overlay() {
         s.resizing = None;
         s.active_annotation = None;
         s.text_edit = 0;
+        s.ime_composing = false;
         s.tool = Tool::Select;
         s.history.clear();
         std::mem::replace(&mut s.overlay, 0)
@@ -832,6 +837,7 @@ fn start_text_edit(overlay: Hwnd) {
             let mut state = cell.borrow_mut();
             state.text_edit = edit;
             state.text_anchor = position;
+            state.ime_composing = false;
         });
         SetFocus(edit);
     }
@@ -841,6 +847,7 @@ fn commit_text_edit() {
     let (edit, position, overlay) = APP.with(|cell| {
         let mut state = cell.borrow_mut();
         let edit = std::mem::replace(&mut state.text_edit, 0);
+        state.ime_composing = false;
         (edit, state.text_anchor, state.overlay)
     });
     if edit == 0 { return; }
@@ -863,7 +870,10 @@ fn commit_text_edit() {
 fn cancel_text_edit() {
     let (edit, overlay) = APP.with(|cell| {
         let mut state = cell.borrow_mut();
-        (std::mem::replace(&mut state.text_edit, 0), state.overlay)
+        {
+            state.ime_composing = false;
+            (std::mem::replace(&mut state.text_edit, 0), state.overlay)
+        }
     });
     if edit != 0 { unsafe { DestroyWindow(edit); } }
     if overlay != 0 {
@@ -875,12 +885,26 @@ fn cancel_text_edit() {
 // WM_KEYDOWN and would otherwise consume Enter/Escape before overlay_proc.
 fn handle_text_edit_key(message: &Msg) -> bool {
     let edit = APP.with(|cell| cell.borrow().text_edit);
-    if edit == 0 || message.hwnd != edit || message.message != WM_KEYDOWN {
-        return false;
-    }
-    match message.wparam {
-        VK_RETURN => { commit_text_edit(); true }
-        VK_ESCAPE => { cancel_text_edit(); true }
+    if edit == 0 || message.hwnd != edit { return false; }
+    // Let the IME consume Enter/Escape while the user is selecting a CJK
+    // candidate. The composition messages must continue to DispatchMessageW.
+    match message.message {
+        WM_IME_STARTCOMPOSITION => {
+            APP.with(|cell| cell.borrow_mut().ime_composing = true);
+            false
+        }
+        WM_IME_ENDCOMPOSITION => {
+            APP.with(|cell| cell.borrow_mut().ime_composing = false);
+            false
+        }
+        WM_KEYDOWN => {
+            if APP.with(|cell| cell.borrow().ime_composing) { return false; }
+            match message.wparam {
+                VK_RETURN => { commit_text_edit(); true }
+                VK_ESCAPE => { cancel_text_edit(); true }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
