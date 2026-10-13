@@ -4,6 +4,10 @@
 mod geometry;
 #[cfg(any(windows, test))]
 mod png;
+#[cfg(any(windows, test))]
+mod annotations;
+#[cfg(any(windows, test))]
+mod selection;
 #[cfg(windows)]
 mod windows;
 
