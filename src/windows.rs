@@ -1036,6 +1036,77 @@ fn tray_data(main: Hwnd, fallback: bool) -> NotifyIconData {
     for (target, c) in data.tip.iter_mut().zip(tooltip.encode_utf16()) { *target = c; }
     data
 }
+
+const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_NAME: &str = "RustShot";
+
+// HKCU Run entry avoids elevation and leaves other users untouched.
+fn startup_command() -> Result<Vec<u16>, String> {
+    let executable = std::env::current_exe()
+        .map_err(|e| format!("Cannot locate RustShot executable: {e}"))?;
+    let mut command = Vec::from([b'"' as u16]);
+    command.extend(executable.as_os_str().encode_wide());
+    command.push(b'"' as u16);
+    command.push(0);
+    Ok(command)
+}
+
+fn open_run_key() -> Result<Handle, String> {
+    let mut key: Handle = 0;
+    let name = utf16(RUN_KEY);
+    let code = unsafe {
+        RegCreateKeyExW(HKEY_CURRENT_USER, name.as_ptr(), 0, null_mut(), 0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE, null(), &mut key, null_mut())
+    };
+    if code != 0 { Err(format!("Cannot access HKCU Run registry: {code}")) }
+    else { Ok(key) }
+}
+
+fn startup_enabled() -> Result<bool, String> {
+    let expected = startup_command()?;
+    let key = open_run_key()?;
+    let value = utf16(RUN_NAME);
+    let mut bytes = 0u32;
+    let mut value_type = 0u32;
+    let status = unsafe {
+        RegQueryValueExW(key, value.as_ptr(), null_mut(),
+            &mut value_type, null_mut(), &mut bytes)
+    };
+    if status != 0 || value_type != REG_SZ || bytes == 0 || bytes > 32768 {
+        unsafe { RegCloseKey(key); }
+        return Ok(false);
+    }
+    let mut data = vec![0u8; bytes as usize];
+    let code = unsafe {
+        RegQueryValueExW(key, value.as_ptr(), null_mut(), &mut value_type,
+            data.as_mut_ptr(), &mut bytes)
+    };
+    unsafe { RegCloseKey(key); }
+    if code != 0 || value_type != REG_SZ || bytes as usize > data.len() ||
+        bytes % 2 != 0 { return Ok(false); }
+    let stored: Vec<u16> = data[..bytes as usize].chunks_exact(2)
+        .map(|v| u16::from_le_bytes([v[0], v[1]])).collect();
+    Ok(stored == expected)
+}
+
+fn set_startup(enabled: bool) -> Result<(), String> {
+    let key = open_run_key()?;
+    let name = utf16(RUN_NAME);
+    let code = if enabled {
+        let command = startup_command()?;
+        let size = command.len().checked_mul(2).ok_or("Registry value overflow")?;
+        unsafe { RegSetValueExW(key, name.as_ptr(), 0, REG_SZ,
+            command.as_ptr() as *const u8, size as u32) }
+    } else {
+        let status = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+        // ERROR_FILE_NOT_FOUND: already disabled
+        if status == 2 { 0 } else { status }
+    };
+    unsafe { RegCloseKey(key); }
+    if code == 0 { Ok(()) }
+    else { Err(format!("Unable to change Windows startup registry value: {code}")) }
+}
+
 fn show_tray_menu(hwnd: Hwnd) {
     // SAFETY: Created menu is destroyed once; TrackPopupMenu returns the selected ID.
     unsafe {
@@ -1043,10 +1114,15 @@ fn show_tray_menu(hwnd: Hwnd) {
         if menu == 0 { return; }
         let take = utf16("截图 / Capture");
         let folder = utf16("打开截图目录 / Open folder");
+        let startup = startup_enabled().unwrap_or(false);
+        let toggle = utf16(if startup { "开机启动：已开启 / Disable" }
+                           else { "开机启动：已关闭 / Enable" });
         let quit = utf16("退出 / Exit");
         AppendMenuW(menu, MF_STRING, 1, take.as_ptr());
         AppendMenuW(menu, MF_STRING, 2, folder.as_ptr());
-        AppendMenuW(menu, MF_STRING, 3, quit.as_ptr());
+        AppendMenuW(menu, MF_STRING | if startup { MF_CHECKED } else { 0 },
+            3, toggle.as_ptr());
+        AppendMenuW(menu, MF_STRING, 4, quit.as_ptr());
         let mut point = WinPoint::default();
         GetCursorPos(&mut point);
         SetForegroundWindow(hwnd);
@@ -1062,7 +1138,12 @@ fn show_tray_menu(hwnd: Hwnd) {
                 }
                 Err(err) => alert(hwnd, &format!("Cannot open screenshot folder: {err}")),
             },
-            3 => { DestroyWindow(hwnd); },
+            3 => {
+                if let Err(err) = set_startup(!startup) {
+                    alert(hwnd, &format!("Startup setting failed: {err}"));
+                }
+            },
+            4 => { DestroyWindow(hwnd); },
             _ => {}
         }
     }
