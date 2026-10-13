@@ -26,6 +26,7 @@ const SRCCOPY: u32 = 0x00CC0020;
 const CAPTUREBLT: u32 = 0x40000000;
 const DIB_RGB_COLORS: u32 = 0;
 const BI_RGB: u32 = 0;
+const BLACKNESS: u32 = 0x00000042;
 const WS_POPUP: u32 = 0x80000000;
 const WS_EX_TOPMOST: u32 = 0x00000008;
 const WS_EX_TOOLWINDOW: u32 = 0x00000080;
@@ -113,6 +114,14 @@ struct PaintStruct {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct BlendFunction {
+    blend_op: u8,
+    blend_flags: u8,
+    constant_alpha: u8,
+    alpha_format: u8,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct BitmapInfoHeader {
     size: u32,
     width: i32,
@@ -191,6 +200,8 @@ extern "system" {
 #[link(name = "gdi32")]
 extern "system" {
     fn CreateCompatibleDC(dc: Hdc) -> Hdc;
+    fn CreateCompatibleBitmap(dc: Hdc, width: i32, height: i32) -> Hobj;
+    fn PatBlt(dc: Hdc, x: i32, y: i32, w: i32, h: i32, rop: u32) -> i32;
     fn DeleteDC(dc: Hdc) -> i32;
     fn CreateDIBSection(dc: Hdc, info: *const BitmapInfo, usage: u32, bits: *mut *mut c_void, section: Handle, offset: u32) -> Hobj;
     fn SelectObject(dc: Hdc, obj: Hobj) -> Hobj;
@@ -216,6 +227,12 @@ extern "system" {
         weight: i32, italic: u32, underline: u32, strikeout: u32, charset: u32,
         output_precision: u32, clip_precision: u32, quality: u32, pitch_family: u32,
         face: *const u16) -> Hobj;
+}
+#[link(name = "msimg32")]
+extern "system" {
+    fn AlphaBlend(destination: Hdc, x: i32, y: i32, width: i32, height: i32,
+        source: Hdc, src_x: i32, src_y: i32, src_width: i32, src_height: i32,
+        blend: BlendFunction) -> i32;
 }
 #[link(name = "shell32")]
 extern "system" {
@@ -259,11 +276,6 @@ fn utf16(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).colle
 fn win_rect(r: Rect) -> WinRect { WinRect { left: r.left, top: r.top, right: r.right, bottom: r.bottom } }
 fn low_word_signed(l: Lparam) -> i32 { l as u16 as i16 as i32 }
 fn high_word_signed(l: Lparam) -> i32 { (l >> 16) as u16 as i16 as i32 }
-fn black_tint(data: &mut [u8]) {
-    for p in data.as_chunks_mut::<4>().0 {
-        for color in p.iter_mut().take(3) { *color = ((*color as u16 * 145) / 255) as u8; }
-    }
-}
 fn bitmap_info(w: i32, h: i32) -> BitmapInfo {
     BitmapInfo { header: BitmapInfoHeader {
         size: size_of::<BitmapInfoHeader>() as u32, width: w, height: -h,
@@ -272,7 +284,7 @@ fn bitmap_info(w: i32, h: i32) -> BitmapInfo {
     }, colors: [0] }
 }
 
-struct Frame { bounds: Rect, pixels: Vec<u8>, dark: Vec<u8>, windows: Vec<Rect> }
+struct Frame { bounds: Rect, pixels: Vec<u8>, windows: Vec<Rect> }
 struct AppState {
     main: Hwnd,
     overlay: Hwnd,
@@ -316,9 +328,10 @@ fn capture_desktop() -> Result<Frame, String> {
     let bounds = virtual_desktop();
     let width = bounds.width();
     let height = bounds.height();
-    let count = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4))
-        .ok_or("Desktop image size overflow")?;
-    if width <= 0 || height <= 0 || count > MAX_CAPTURE_BYTES { return Err("Unsupported virtual desktop size".into()); }
+    if width <= 0 || height <= 0 { return Err("Unsupported virtual desktop size".into()); }
+    let count = (width as usize).checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4)).ok_or("Desktop image size overflow")?;
+    if count > MAX_CAPTURE_BYTES { return Err("Desktop exceeds 512 MiB screenshot limit".into()); }
     // SAFETY: CreateDIBSection gives us a mapped pixel buffer while its HBITMAP exists.
     // Every created GDI object and acquired HDC is released on both success and error.
     unsafe {
@@ -342,9 +355,7 @@ fn capture_desktop() -> Result<Frame, String> {
         DeleteDC(dest);
         ReleaseDC(0, src);
         if !copied { return Err("BitBlt failed to capture desktop".into()); }
-        let mut dark = pixels.clone();
-        black_tint(&mut dark);
-        Ok(Frame { bounds, pixels, dark, windows: enumerate_windows(bounds) })
+        Ok(Frame { bounds, pixels, windows: enumerate_windows(bounds) })
     }
 }
 
@@ -539,6 +550,31 @@ unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect, a: &Annotation
         crop.as_ptr() as *const c_void, &info, DIB_RGB_COLORS, SRCCOPY);
 }
 
+// A stretched, constant-alpha black bitmap dims the frozen screenshot using
+// only a 1x1 GDI bitmap. No second full-desktop BGRA buffer is retained.
+fn draw_dimming_layer(target: Hdc, width: i32, height: i32) {
+    if width <= 0 || height <= 0 { return; }
+    unsafe {
+        let source = CreateCompatibleDC(target);
+        if source == 0 { return; }
+        let bitmap = CreateCompatibleBitmap(target, 1, 1);
+        if bitmap == 0 {
+            DeleteDC(source);
+            return;
+        }
+        let previous = SelectObject(source, bitmap);
+        if previous != 0 {
+            PatBlt(source, 0, 0, 1, 1, BLACKNESS);
+            AlphaBlend(target, 0, 0, width, height, source, 0, 0, 1, 1,
+                BlendFunction { blend_op: 0, blend_flags: 0,
+                    constant_alpha: 110, alpha_format: 0 });
+            SelectObject(source, previous);
+        }
+        DeleteObject(bitmap);
+        DeleteDC(source);
+    }
+}
+
 fn paint_overlay(hwnd: Hwnd) {
     // SAFETY: BeginPaint/EndPaint are paired; HDC is only used inside the paint call.
     unsafe {
@@ -550,8 +586,9 @@ fn paint_overlay(hwnd: Hwnd) {
             let Some(frame) = &state.frame else { return; };
             let info = bitmap_info(frame.bounds.width(), frame.bounds.height());
             StretchDIBits(dc, 0, 0, frame.bounds.width(), frame.bounds.height(), 0, 0,
-                frame.bounds.width(), frame.bounds.height(), frame.dark.as_ptr() as *const c_void,
+                frame.bounds.width(), frame.bounds.height(), frame.pixels.as_ptr() as *const c_void,
                 &info, DIB_RGB_COLORS, SRCCOPY);
+            draw_dimming_layer(dc, frame.bounds.width(), frame.bounds.height());
             let active = state.selected.or(state.hover);
             if let Some(selection) = active.and_then(|s| s.intersection(frame.bounds)) {
                 let rel = selection.translated(-frame.bounds.left, -frame.bounds.top);
