@@ -1,6 +1,7 @@
 //! Minimal native Win32/GDI baseline for the first screenshot PoC.
 //! No external crates; unsafe FFI calls are isolated here. Windows 11 validation is pending.
 use crate::annotations::{self, Annotation, History, Tool};
+use std::os::windows::ffi::OsStrExt;
 use crate::geometry::{Point, Rect};
 use crate::selection::Handle as ResizeHandle;
 use crate::png;
@@ -35,6 +36,17 @@ const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_KEYDOWN: u32 = 0x0100;
+const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
+const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
+const WS_CHILD: u32 = 0x40000000;
+const WS_VISIBLE: u32 = 0x10000000;
+const WS_BORDER: u32 = 0x00800000;
+const ES_AUTOHSCROLL: u32 = 0x0080;
+const MF_CHECKED: u32 = 0x0008;
+const HKEY_CURRENT_USER: Handle = 0x80000001u32 as Handle;
+const REG_SZ: u32 = 1;
+const KEY_QUERY_VALUE: u32 = 0x0001;
+const KEY_SET_VALUE: u32 = 0x0002;
 const WM_HOTKEY: u32 = 0x0312;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -156,6 +168,8 @@ extern "system" {
     fn ReleaseCapture() -> i32;
     fn SetFocus(hwnd: Hwnd) -> Hwnd;
     fn GetKeyState(key: i32) -> i16;
+    fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
+    fn GetWindowTextW(hwnd: Hwnd, buf: *mut u16, capacity: i32) -> i32;
     fn EnumWindows(cb: Option<unsafe extern "system" fn(Hwnd, Lparam) -> i32>, lparam: Lparam) -> i32;
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
     fn IsIconic(hwnd: Hwnd) -> i32;
@@ -197,6 +211,11 @@ extern "system" {
     fn SetTextColor(dc: Hdc, color: u32) -> u32;
     fn SetBkMode(dc: Hdc, mode: i32) -> i32;
     fn TextOutW(dc: Hdc, x: i32, y: i32, text: *const u16, len: i32) -> i32;
+    fn GdiFlush() -> i32;
+    fn CreateFontW(height: i32, width: i32, escapement: i32, orientation: i32,
+        weight: i32, italic: u32, underline: u32, strikeout: u32, charset: u32,
+        output_precision: u32, clip_precision: u32, quality: u32, pitch_family: u32,
+        face: *const u16) -> Hobj;
 }
 #[link(name = "shell32")]
 extern "system" {
@@ -216,6 +235,18 @@ extern "system" {
     fn GlobalFree(handle: Handle) -> Handle;
     fn GetLocalTime(time: *mut SystemTime);
     fn MoveFileW(existing: *const u16, new_path: *const u16) -> i32;
+}
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegCreateKeyExW(root: Handle, subkey: *const u16, reserved: u32,
+        class: *mut u16, options: u32, access: u32, security: *const c_void,
+        result: *mut Handle, disposition: *mut u32) -> u32;
+    fn RegQueryValueExW(key: Handle, name: *const u16, reserved: *mut u32,
+        value_type: *mut u32, data: *mut u8, size: *mut u32) -> u32;
+    fn RegSetValueExW(key: Handle, name: *const u16, reserved: u32, value_type: u32,
+        data: *const u8, size: u32) -> u32;
+    fn RegDeleteValueW(key: Handle, name: *const u16) -> u32;
+    fn RegCloseKey(key: Handle) -> u32;
 }
 #[link(name = "dwmapi")]
 extern "system" {
@@ -252,6 +283,9 @@ struct AppState {
     moving: bool,
     resizing: Option<ResizeHandle>,
     active_annotation: Option<Annotation>,
+    text_edit: Hwnd,
+    text_anchor: Point,
+    ime_composing: bool,
     tool: Tool,
     history: History,
     drag_anchor: Point,
@@ -262,7 +296,8 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
-            dragging: false, moving: false, resizing: None, active_annotation: None,
+            dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
+            ime_composing: false,
             tool: Tool::Select, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, writers: Vec::new() }
     }
 }
@@ -342,7 +377,7 @@ fn local_pos(frame: &Frame, l: Lparam) -> Point {
     Point { x: frame.bounds.left + low_word_signed(l), y: frame.bounds.top + high_word_signed(l) }
 }
 fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
-    let width = 540.min(bounds.width().max(1));
+    let width = 630.min(bounds.width().max(1));
     let height = 34.min(bounds.height().max(1));
     let x = (selection.right - width).clamp(bounds.left, bounds.right - width);
     let proposed = selection.bottom + 7;
@@ -388,12 +423,20 @@ unsafe fn preview_annotation(dc: Hdc, a: &Annotation, origin: Point) {
         Tool::Pen => {
             for segment in a.points.windows(2) { line(segment[0], segment[1]); }
         }
-        Tool::Select => {}
+        Tool::Text => {
+            let words = utf16(&a.text);
+            if words.len() > 1 {
+                TextOutW(dc, first.x - origin.x, first.y - origin.y,
+                    words.as_ptr(), words.len() as i32 - 1);
+            }
+        }
+        Tool::Mosaic | Tool::Select => {}
     }
 }
 
-fn paint_annotations(dc: Hdc, origin: Point, selection: Rect, history: &History,
+fn paint_annotations(dc: Hdc, frame: &Frame, selection: Rect, history: &History,
     current: Option<&Annotation>) {
+    let origin = Point { x: frame.bounds.left, y: frame.bounds.top };
     unsafe {
         let saved = SaveDC(dc);
         if saved == 0 { return; }
@@ -403,14 +446,97 @@ fn paint_annotations(dc: Hdc, origin: Point, selection: Rect, history: &History,
         if pen != 0 {
             let old_pen = SelectObject(dc, pen);
             let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            for a in &history.committed { preview_annotation(dc, a, origin); }
-            if let Some(a) = current { preview_annotation(dc, a, origin); }
+            let font = create_annotation_font();
+            let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, 0x002730E8);
+            for a in history.committed.iter().chain(current) {
+                if a.tool == Tool::Mosaic { preview_mosaic(dc, frame, selection, a); }
+                else { preview_annotation(dc, a, origin); }
+            }
+            if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
             SelectObject(dc, old_brush);
             SelectObject(dc, old_pen);
             DeleteObject(pen);
         }
         RestoreDC(dc, saved);
     }
+}
+
+
+fn create_annotation_font() -> Hobj {
+    let face = utf16("Microsoft YaHei UI");
+    unsafe {
+        CreateFontW(22, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, face.as_ptr())
+    }
+}
+
+// Render text into the pixel buffer used for both clipboard and PNG. Keep
+// non-text raster operations before/after each label in original history order.
+fn render_text_to_pixels(pixels: &mut [u8], width: u32, height: u32,
+    origin: Point, annotation: &Annotation) {
+    if annotation.tool != Tool::Text || annotation.text.is_empty() ||
+        width == 0 || height == 0 || width > i32::MAX as u32 ||
+        height > i32::MAX as u32 { return; }
+    unsafe {
+        let screen = GetDC(0);
+        if screen == 0 { return; }
+        let dc = CreateCompatibleDC(screen);
+        if dc == 0 { ReleaseDC(0, screen); return; }
+        let mut bits: *mut c_void = null_mut();
+        let info = bitmap_info(width as i32, height as i32);
+        let bmp = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, 0, 0);
+        if bmp == 0 || bits.is_null() {
+            if bmp != 0 { DeleteObject(bmp); }
+            DeleteDC(dc);
+            ReleaseDC(0, screen);
+            return;
+        }
+        let old_bmp = SelectObject(dc, bmp);
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
+        let font = create_annotation_font();
+        let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, 0x002730E8);
+        let string = utf16(&annotation.text);
+        let position = annotation.points[0];
+        TextOutW(dc, position.x - origin.x, position.y - origin.y,
+            string.as_ptr(), string.len() as i32 - 1);
+        GdiFlush();
+        std::ptr::copy_nonoverlapping(bits as *const u8, pixels.as_mut_ptr(), pixels.len());
+        if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
+        if old_bmp != 0 { SelectObject(dc, old_bmp); }
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        ReleaseDC(0, screen);
+    }
+}
+
+// Draw the exact pixel blocks from the captured frame, not an ornamental
+// checkerboard. Use small temporary buffers only for the obscured region.
+unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect, a: &Annotation) {
+    if a.points.len() < 2 { return; }
+    let clipped = Rect::from_points(a.points[0], a.points[1])
+        .intersection(selection)
+        .and_then(|r| r.intersection(frame.bounds));
+    let Some(rect) = clipped else { return; };
+    let w = rect.width() as usize;
+    let h = rect.height() as usize;
+    let Some(bytes) = w.checked_mul(h).and_then(|v| v.checked_mul(4)) else { return; };
+    if bytes == 0 || bytes > MAX_CAPTURE_BYTES { return; }
+    let mut crop = Vec::with_capacity(bytes);
+    for y in 0..h {
+        let frame_y = (rect.top - frame.bounds.top) as usize + y;
+        let frame_x = (rect.left - frame.bounds.left) as usize;
+        let offset = (frame_y * frame.bounds.width() as usize + frame_x) * 4;
+        crop.extend_from_slice(&frame.pixels[offset..offset + w * 4]);
+    }
+    annotations::render(&mut crop, w as u32, h as u32,
+        Point { x: rect.left, y: rect.top }, std::slice::from_ref(a));
+    let info = bitmap_info(rect.width(), rect.height());
+    StretchDIBits(dc, rect.left - frame.bounds.left, rect.top - frame.bounds.top,
+        rect.width(), rect.height(), 0, 0, rect.width(), rect.height(),
+        crop.as_ptr() as *const c_void, &info, DIB_RGB_COLORS, SRCCOPY);
 }
 
 fn paint_overlay(hwnd: Hwnd) {
@@ -445,7 +571,7 @@ fn paint_overlay(hwnd: Hwnd) {
                 let text = utf16(&title);
                 TextOutW(dc, rel.left + 2, (rel.top - 20).max(0), text.as_ptr(), text.len() as i32 - 1);
                 if state.selected.is_some() {
-                    paint_annotations(dc, Point { x: frame.bounds.left, y: frame.bounds.top },
+                    paint_annotations(dc, frame,
                         selection, &state.history,
                         state.active_annotation.as_ref());
                     let white = CreateSolidBrush(0x00FFFFFF);
@@ -473,14 +599,16 @@ fn paint_overlay(hwnd: Hwnd) {
                     }
                     let labels = [
                         Tool::LABELS[0], Tool::LABELS[1], Tool::LABELS[2],
-                        Tool::LABELS[3], Tool::LABELS[4], "撤销", "重做", "完成", "取消",
+                        Tool::LABELS[3], Tool::LABELS[4], Tool::LABELS[5],
+                        Tool::LABELS[6], "撤销", "重做", "完成", "取消",
                     ];
                     SetBkMode(dc, TRANSPARENT);
                     for (index, label) in labels.iter().enumerate() {
-                        let left = bar.left + index as i32 * bar.width() / 9;
-                        let right = bar.left + (index as i32 + 1) * bar.width() / 9;
-                        if index < 5 && state.tool == [
-                            Tool::Select, Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Pen
+                        let left = bar.left + index as i32 * bar.width() / 11;
+                        let right = bar.left + (index as i32 + 1) * bar.width() / 11;
+                        if index < 7 && state.tool == [
+                            Tool::Select, Tool::Rectangle, Tool::Ellipse, Tool::Arrow,
+                            Tool::Pen, Tool::Text, Tool::Mosaic
                         ][index] {
                             let brush = CreateSolidBrush(0x00D5F4E4);
                             if brush != 0 {
@@ -489,7 +617,7 @@ fn paint_overlay(hwnd: Hwnd) {
                                 DeleteObject(brush);
                             }
                         }
-                        SetTextColor(dc, if index == 7 { 0x002A9B21 } else { 0x00555555 });
+                        SetTextColor(dc, if index == 9 { 0x002A9B21 } else { 0x00555555 });
                         let glyphs = utf16(label);
                         TextOutW(dc, left + 5, bar.top + 9, glyphs.as_ptr(), glyphs.len() as i32 - 1);
                     }
@@ -502,7 +630,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.1.0");
+    let title = utf16("RustShot v0.3.0");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }
@@ -532,6 +660,7 @@ fn start_capture() {
 }
 
 fn close_overlay() {
+    cancel_text_edit();
     let hwnd = APP.with(|cell| {
         let mut s = cell.borrow_mut();
         s.frame = None;
@@ -541,6 +670,8 @@ fn close_overlay() {
         s.moving = false;
         s.resizing = None;
         s.active_annotation = None;
+        s.text_edit = 0;
+        s.ime_composing = false;
         s.tool = Tool::Select;
         s.history.clear();
         std::mem::replace(&mut s.overlay, 0)
@@ -561,8 +692,15 @@ fn selected_image() -> Option<(u32, u32, Vec<u8>)> {
             let offset = (y * frame.bounds.width() as usize + left) * 4;
             crop.extend_from_slice(&frame.pixels[offset..offset + rect.width() as usize * 4]);
         }
-        annotations::render(&mut crop, rect.width() as u32, rect.height() as u32,
-            Point { x: rect.left, y: rect.top }, &state.history.committed);
+        for a in &state.history.committed {
+            if a.tool == Tool::Text {
+                render_text_to_pixels(&mut crop, rect.width() as u32, rect.height() as u32,
+                    Point { x: rect.left, y: rect.top }, a);
+            } else {
+                annotations::render(&mut crop, rect.width() as u32, rect.height() as u32,
+                    Point { x: rect.left, y: rect.top }, std::slice::from_ref(a));
+            }
+        }
         Some((rect.width() as u32, rect.height() as u32, crop))
     })
 }
@@ -653,6 +791,7 @@ fn save_png(width: u32, height: u32, pixels: &[u8]) -> io::Result<PathBuf> {
 }
 
 fn finish_capture() {
+    commit_text_edit();
     let picture = selected_image();
     let owner = APP.with(|s| s.borrow().main);
     close_overlay();
@@ -675,6 +814,101 @@ fn finish_capture() {
     if let Err(err) = copied { alert(owner, &format!("Clipboard copy failed; PNG save will still be attempted: {err}")); }
 }
 
+
+fn start_text_edit(overlay: Hwnd) {
+    cancel_text_edit();
+    let (position, bounds) = APP.with(|cell| {
+        let state = cell.borrow();
+        let bounds = state.frame.as_ref().map(|f| f.bounds).unwrap_or_default();
+        (state.drag_anchor, bounds)
+    });
+    if bounds.width() <= 0 || bounds.height() <= 0 { return; }
+    let x = (position.x - bounds.left).clamp(0, (bounds.width() - 1).max(0));
+    let y = (position.y - bounds.top).clamp(0, (bounds.height() - 1).max(0));
+    let width = 300.min((bounds.width() - x).max(1));
+    let height = 32.min((bounds.height() - y).max(1));
+    let class = utf16("EDIT");
+    unsafe {
+        let edit = CreateWindowExW(0, class.as_ptr(), utf16("").as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            x, y, width, height, overlay, 0, GetModuleHandleW(null()), null());
+        if edit == 0 { alert(overlay, "Unable to open the text editor"); return; }
+        APP.with(|cell| {
+            let mut state = cell.borrow_mut();
+            state.text_edit = edit;
+            state.text_anchor = position;
+            state.ime_composing = false;
+        });
+        SetFocus(edit);
+    }
+}
+
+fn commit_text_edit() {
+    let (edit, position, overlay) = APP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let edit = std::mem::replace(&mut state.text_edit, 0);
+        state.ime_composing = false;
+        (edit, state.text_anchor, state.overlay)
+    });
+    if edit == 0 { return; }
+    let words = unsafe {
+        // Limit input to 512 UTF-16 units, preventing pathological label sizes.
+        let count = GetWindowTextLengthW(edit).clamp(0, 512) as usize;
+        let mut buffer = vec![0u16; count + 1];
+        let read = GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
+        DestroyWindow(edit);
+        String::from_utf16_lossy(&buffer[..read.max(0) as usize])
+    };
+    if !words.trim().is_empty() {
+        APP.with(|cell| cell.borrow_mut().history.push(Annotation::text_at(position, words)));
+    }
+    if overlay != 0 {
+        unsafe { SetFocus(overlay); InvalidateRect(overlay, null(), 0); }
+    }
+}
+
+fn cancel_text_edit() {
+    let (edit, overlay) = APP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        {
+            state.ime_composing = false;
+            (std::mem::replace(&mut state.text_edit, 0), state.overlay)
+        }
+    });
+    if edit != 0 { unsafe { DestroyWindow(edit); } }
+    if overlay != 0 {
+        unsafe { SetFocus(overlay); InvalidateRect(overlay, null(), 0); }
+    }
+}
+
+// Called before TranslateMessage, because standard EDIT child windows own
+// WM_KEYDOWN and would otherwise consume Enter/Escape before overlay_proc.
+fn handle_text_edit_key(message: &Msg) -> bool {
+    let edit = APP.with(|cell| cell.borrow().text_edit);
+    if edit == 0 || message.hwnd != edit { return false; }
+    // Let the IME consume Enter/Escape while the user is selecting a CJK
+    // candidate. The composition messages must continue to DispatchMessageW.
+    match message.message {
+        WM_IME_STARTCOMPOSITION => {
+            APP.with(|cell| cell.borrow_mut().ime_composing = true);
+            false
+        }
+        WM_IME_ENDCOMPOSITION => {
+            APP.with(|cell| cell.borrow_mut().ime_composing = false);
+            false
+        }
+        WM_KEYDOWN => {
+            if APP.with(|cell| cell.borrow().ime_composing) { return false; }
+            match message.wparam {
+                VK_RETURN => { commit_text_edit(); true }
+                VK_ESCAPE => { cancel_text_edit(); true }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn mouse_down(hwnd: Hwnd, l: Lparam) {
     let action = APP.with(|cell| {
         let mut state = cell.borrow_mut();
@@ -684,8 +918,8 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         if let Some(selection) = state.selected {
             let bar = toolbar_for(selection, bounds);
             if bar.contains(point) {
-                return ((i64::from(point.x - bar.left) * 9 / i64::from(bar.width())) as usize)
-                    .min(8) + 1;
+                return ((i64::from(point.x - bar.left) * 11 / i64::from(bar.width())) as usize)
+                    .min(10) + 1;
             }
         }
 
@@ -703,6 +937,8 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
                     state.moving = true;
                     state.drag_initial = selection;
                     state.history.clear();
+                } else if state.tool == Tool::Text {
+                    return 20;
                 } else {
                     state.active_annotation = Some(Annotation::begin(state.tool, point));
                 }
@@ -716,25 +952,30 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         0
     });
     match action {
-        1..=5 => {
+        1..=7 => {
+            commit_text_edit();
             APP.with(|cell| {
                 cell.borrow_mut().tool = match action {
                     1 => Tool::Select, 2 => Tool::Rectangle, 3 => Tool::Ellipse,
-                    4 => Tool::Arrow, _ => Tool::Pen,
+                    4 => Tool::Arrow, 5 => Tool::Pen, 6 => Tool::Text,
+                    _ => Tool::Mosaic,
                 };
             });
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
-        6 => {
+        8 => {
+            commit_text_edit();
             APP.with(|cell| { cell.borrow_mut().history.undo(); });
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
-        7 => {
+        9 => {
+            commit_text_edit();
             APP.with(|cell| { cell.borrow_mut().history.redo(); });
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
-        8 => finish_capture(),
-        9 => close_overlay(),
+        10 => finish_capture(),
+        11 => close_overlay(),
+        20 => start_text_edit(hwnd),
         _ => { unsafe { SetCapture(hwnd); } }
     }
 }
@@ -818,6 +1059,77 @@ fn tray_data(main: Hwnd, fallback: bool) -> NotifyIconData {
     for (target, c) in data.tip.iter_mut().zip(tooltip.encode_utf16()) { *target = c; }
     data
 }
+
+const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_NAME: &str = "RustShot";
+
+// HKCU Run entry avoids elevation and leaves other users untouched.
+fn startup_command() -> Result<Vec<u16>, String> {
+    let executable = std::env::current_exe()
+        .map_err(|e| format!("Cannot locate RustShot executable: {e}"))?;
+    let mut command = Vec::from([b'"' as u16]);
+    command.extend(executable.as_os_str().encode_wide());
+    command.push(b'"' as u16);
+    command.push(0);
+    Ok(command)
+}
+
+fn open_run_key() -> Result<Handle, String> {
+    let mut key: Handle = 0;
+    let name = utf16(RUN_KEY);
+    let code = unsafe {
+        RegCreateKeyExW(HKEY_CURRENT_USER, name.as_ptr(), 0, null_mut(), 0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE, null(), &mut key, null_mut())
+    };
+    if code != 0 { Err(format!("Cannot access HKCU Run registry: {code}")) }
+    else { Ok(key) }
+}
+
+fn startup_enabled() -> Result<bool, String> {
+    let expected = startup_command()?;
+    let key = open_run_key()?;
+    let value = utf16(RUN_NAME);
+    let mut bytes = 0u32;
+    let mut value_type = 0u32;
+    let status = unsafe {
+        RegQueryValueExW(key, value.as_ptr(), null_mut(),
+            &mut value_type, null_mut(), &mut bytes)
+    };
+    if status != 0 || value_type != REG_SZ || bytes == 0 || bytes > 32768 {
+        unsafe { RegCloseKey(key); }
+        return Ok(false);
+    }
+    let mut data = vec![0u8; bytes as usize];
+    let code = unsafe {
+        RegQueryValueExW(key, value.as_ptr(), null_mut(), &mut value_type,
+            data.as_mut_ptr(), &mut bytes)
+    };
+    unsafe { RegCloseKey(key); }
+    if code != 0 || value_type != REG_SZ || bytes as usize > data.len() ||
+        !bytes.is_multiple_of(2) { return Ok(false); }
+    let stored: Vec<u16> = data[..bytes as usize].as_chunks::<2>().0.iter()
+        .map(|v| u16::from_le_bytes(*v)).collect();
+    Ok(stored == expected)
+}
+
+fn set_startup(enabled: bool) -> Result<(), String> {
+    let key = open_run_key()?;
+    let name = utf16(RUN_NAME);
+    let code = if enabled {
+        let command = startup_command()?;
+        let size = command.len().checked_mul(2).ok_or("Registry value overflow")?;
+        unsafe { RegSetValueExW(key, name.as_ptr(), 0, REG_SZ,
+            command.as_ptr() as *const u8, size as u32) }
+    } else {
+        let status = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+        // ERROR_FILE_NOT_FOUND: already disabled
+        if status == 2 { 0 } else { status }
+    };
+    unsafe { RegCloseKey(key); }
+    if code == 0 { Ok(()) }
+    else { Err(format!("Unable to change Windows startup registry value: {code}")) }
+}
+
 fn show_tray_menu(hwnd: Hwnd) {
     // SAFETY: Created menu is destroyed once; TrackPopupMenu returns the selected ID.
     unsafe {
@@ -825,10 +1137,15 @@ fn show_tray_menu(hwnd: Hwnd) {
         if menu == 0 { return; }
         let take = utf16("截图 / Capture");
         let folder = utf16("打开截图目录 / Open folder");
+        let startup = startup_enabled().unwrap_or(false);
+        let toggle = utf16(if startup { "开机启动：已开启 / Disable" }
+                           else { "开机启动：已关闭 / Enable" });
         let quit = utf16("退出 / Exit");
         AppendMenuW(menu, MF_STRING, 1, take.as_ptr());
         AppendMenuW(menu, MF_STRING, 2, folder.as_ptr());
-        AppendMenuW(menu, MF_STRING, 3, quit.as_ptr());
+        AppendMenuW(menu, MF_STRING | if startup { MF_CHECKED } else { 0 },
+            3, toggle.as_ptr());
+        AppendMenuW(menu, MF_STRING, 4, quit.as_ptr());
         let mut point = WinPoint::default();
         GetCursorPos(&mut point);
         SetForegroundWindow(hwnd);
@@ -844,7 +1161,12 @@ fn show_tray_menu(hwnd: Hwnd) {
                 }
                 Err(err) => alert(hwnd, &format!("Cannot open screenshot folder: {err}")),
             },
-            3 => { DestroyWindow(hwnd); },
+            3 => {
+                if let Err(err) = set_startup(!startup) {
+                    alert(hwnd, &format!("Startup setting failed: {err}"));
+                }
+            },
+            4 => { DestroyWindow(hwnd); },
             _ => {}
         }
     }
@@ -910,6 +1232,7 @@ pub fn run() {
         ShowWindow(hwnd, SW_HIDE);
         let mut msg: Msg = zeroed();
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            if handle_text_edit_key(&msg) { continue; }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
