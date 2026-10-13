@@ -20,6 +20,7 @@ Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workfl
 - Full virtual-desktop signed coordinates, process Per-Monitor-V2 DPI awareness, clipping of selection/annotations, limited temporary files and atomic save.
 - v0.4 uses 32-bit virtual-screen cursor coordinates from `GetCursorPos` instead of relying solely on truncated Win32 16-bit mouse `LPARAM` coordinates. The selection overlay closes on DPI/display changes and attempts to restore the previously active window after capture/cancel.
 - PNG saves use a bounded-memory, dependency-free streamed zlib-stored-block writer with chunk CRC and full multi-block round-trip unit tests. It does **not** compress the image to a smaller file. This removes large temporary RGB and zlib buffers.
+- Concurrent full-resolution PNG writers are capped at **two**. If screenshots are taken faster than they can be saved, the next save waits for the oldest rather than accumulating unbounded pixel buffers.
 - Dependency-free, native Win32/GDI implementation, no third-party Rust crates.
 
 ### Keyboard / mouse quick start
