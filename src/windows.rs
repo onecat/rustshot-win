@@ -162,6 +162,7 @@ extern "system" {
     fn TrackPopupMenu(menu: Handle, flags: u32, x: i32, y: i32, reserved: i32, hwnd: Hwnd, rect: *const WinRect) -> i32;
     fn DestroyMenu(menu: Handle) -> i32;
     fn MessageBoxW(hwnd: Hwnd, text: *const u16, title: *const u16, flags: u32) -> i32;
+    fn FillRect(dc: Hdc, rect: *const WinRect, brush: Hobj) -> i32;
     fn OpenClipboard(hwnd: Hwnd) -> i32;
     fn EmptyClipboard() -> i32;
     fn SetClipboardData(format: u32, handle: Handle) -> Handle;
@@ -184,7 +185,6 @@ extern "system" {
     fn SetTextColor(dc: Hdc, color: u32) -> u32;
     fn SetBkMode(dc: Hdc, mode: i32) -> i32;
     fn TextOutW(dc: Hdc, x: i32, y: i32, text: *const u16, len: i32) -> i32;
-    fn FillRect(dc: Hdc, rect: *const WinRect, brush: Hobj) -> i32;
 }
 #[link(name = "shell32")]
 extern "system" {
@@ -313,7 +313,7 @@ unsafe extern "system" fn enumerate_windows_callback(hwnd: Hwnd, value: Lparam) 
     1
 }
 fn enumerate_windows(bounds: Rect) -> Vec<Rect> {
-    let mut list = Vec::new();
+    let mut list = Vec::<Rect>::new();
     // SAFETY: Callback only holds pointer during this synchronous EnumWindows call.
     unsafe { EnumWindows(Some(enumerate_windows_callback), &mut list as *mut _ as Lparam); }
     list.into_iter().filter_map(|r| r.intersection(bounds)).collect()
