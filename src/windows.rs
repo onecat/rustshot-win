@@ -36,6 +36,7 @@ const WM_DESTROY: u32 = 0x0002;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
+const WM_DPICHANGED: u32 = 0x02E0;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
 const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
@@ -184,6 +185,8 @@ extern "system" {
     fn IsIconic(hwnd: Hwnd) -> i32;
     fn GetWindowRect(hwnd: Hwnd, rect: *mut WinRect) -> i32;
     fn GetCursorPos(point: *mut WinPoint) -> i32;
+    fn GetForegroundWindow() -> Hwnd;
+    fn IsWindow(hwnd: Hwnd) -> i32;
     fn LoadIconW(inst: Handle, name: *const u16) -> Handle;
     fn LoadCursorW(inst: Handle, name: *const u16) -> Handle;
     fn CreatePopupMenu() -> Handle;
@@ -303,6 +306,7 @@ struct AppState {
     drag_anchor: Point,
     drag_initial: Rect,
     fallback_hotkey: bool,
+    restore_focus: Hwnd,
     writers: Vec<thread::JoinHandle<()>>,
 }
 impl AppState {
@@ -310,7 +314,7 @@ impl AppState {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
             dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
             ime_composing: false,
-            tool: Tool::Select, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, writers: Vec::new() }
+            tool: Tool::Select, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
     }
 }
 thread_local! { static APP: RefCell<AppState> = RefCell::new(AppState::new()); }
@@ -320,7 +324,7 @@ fn virtual_desktop() -> Rect {
     unsafe {
         let x = GetSystemMetrics(76);
         let y = GetSystemMetrics(77);
-        Rect { left: x, top: y, right: x + GetSystemMetrics(78), bottom: y + GetSystemMetrics(79) }
+        Rect { left: x, top: y, right: x.saturating_add(GetSystemMetrics(78)), bottom: y.saturating_add(GetSystemMetrics(79)) }
     }
 }
 
@@ -385,14 +389,28 @@ fn hit_test(frame: &Frame, p: Point) -> Option<Rect> {
     frame.windows.iter().copied().find(|rect| rect.contains(p))
 }
 fn local_pos(frame: &Frame, l: Lparam) -> Point {
-    Point { x: frame.bounds.left + low_word_signed(l), y: frame.bounds.top + high_word_signed(l) }
+    // LPARAM packs signed 16-bit client coordinates and truncates desktop spans
+    // wider than 32767 pixels. GetCursorPos supplies 32-bit virtual-desktop
+    // screen coordinates in this Per-Monitor-V2 DPI-aware process.
+    let mut cursor = WinPoint::default();
+    if unsafe { GetCursorPos(&mut cursor) } != 0 {
+        Point { x: cursor.x, y: cursor.y }
+    } else {
+        Point { x: frame.bounds.left.saturating_add(low_word_signed(l)),
+            y: frame.bounds.top.saturating_add(high_word_signed(l)) }
+    }
 }
 fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
     let width = 630.min(bounds.width().max(1));
     let height = 34.min(bounds.height().max(1));
-    let x = (selection.right - width).clamp(bounds.left, bounds.right - width);
-    let proposed = selection.bottom + 7;
-    let y = if proposed + height <= bounds.bottom { proposed } else { (selection.top - 7 - height).max(bounds.top) };
+    let x = selection.right.saturating_sub(width)
+        .clamp(bounds.left, bounds.right.saturating_sub(width));
+    let proposed = selection.bottom.saturating_add(7);
+    let y = if proposed.saturating_add(height) <= bounds.bottom {
+        proposed
+    } else {
+        selection.top.saturating_sub(7).saturating_sub(height).max(bounds.top)
+    };
     Rect { left: x, top: y, right: x + width, bottom: y + height }
 }
 
@@ -667,7 +685,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.3.0");
+    let title = utf16("RustShot v0.4.0");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }
@@ -675,6 +693,13 @@ fn alert(hwnd: Hwnd, message: &str) {
 fn start_capture() {
     let existing = APP.with(|s| s.borrow().overlay != 0);
     if existing { return; }
+    // Snapshot the previously active window only when it belongs to another
+    // process. Tray menu deliberately foregrounds the hidden main window.
+    let previous = unsafe { GetForegroundWindow() };
+    APP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        state.restore_focus = if previous == state.main { 0 } else { previous };
+    });
     match capture_desktop() {
         Ok(frame) => {
             let bounds = frame.bounds;
@@ -711,9 +736,17 @@ fn close_overlay() {
         s.ime_composing = false;
         s.tool = Tool::Select;
         s.history.clear();
-        std::mem::replace(&mut s.overlay, 0)
+        let previous = std::mem::replace(&mut s.restore_focus, 0);
+        (std::mem::replace(&mut s.overlay, 0), previous)
     });
-    if hwnd != 0 { unsafe { ReleaseCapture(); DestroyWindow(hwnd); } }
+    let (hwnd, previous) = hwnd;
+    if hwnd != 0 {
+        unsafe {
+            ReleaseCapture();
+            DestroyWindow(hwnd);
+            if previous != 0 && IsWindow(previous) != 0 { SetForegroundWindow(previous); }
+        }
+    }
 }
 
 fn selected_image() -> Option<(u32, u32, Vec<u8>)> {
@@ -1079,7 +1112,7 @@ unsafe extern "system" fn overlay_proc(hwnd: Hwnd, message: u32, w: Wparam, l: L
             0
         }
         WM_KEYDOWN if w == VK_ESCAPE => { close_overlay(); 0 }
-        WM_RBUTTONUP | WM_CLOSE | WM_DISPLAYCHANGE => { close_overlay(); 0 }
+        WM_RBUTTONUP | WM_CLOSE | WM_DISPLAYCHANGE | WM_DPICHANGED => { close_overlay(); 0 }
         _ => DefWindowProcW(hwnd, message, w, l),
     }
 }
@@ -1214,7 +1247,7 @@ unsafe extern "system" fn main_proc(hwnd: Hwnd, message: u32, _w: Wparam, l: Lpa
         WM_HOTKEY => { start_capture(); 0 }
         WM_APP_TRAY if l as u32 == WM_RBUTTONUP || l as u32 == WM_CONTEXTMENU => { show_tray_menu(hwnd); 0 }
         WM_APP_TRAY if l as u32 == WM_LBUTTONUP => { start_capture(); 0 }
-        WM_DISPLAYCHANGE => { close_overlay(); 0 }
+        WM_DISPLAYCHANGE | WM_DPICHANGED => { close_overlay(); 0 }
         WM_DESTROY => {
             close_overlay();
             UnregisterHotKey(hwnd, 1);
