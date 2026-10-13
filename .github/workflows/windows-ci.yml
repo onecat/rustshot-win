@@ -1,0 +1,38 @@
+name: Windows CI and portable prototype
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format and parse prototype code
+        run: cargo fmt --all
+      - name: Verify formatter can round-trip
+        run: cargo fmt --all -- --check
+      - name: Static checks
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --all-targets
+      - name: Build x64 Release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Package prototype
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/rustshot.exe dist/RustShot.exe
+          Copy-Item README.md dist/README.txt
+          Compress-Archive -Path dist/* -DestinationPath RustShot-v0.1.0-win-x64-portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustShot-v0.1.0-win-x64-portable
+          path: RustShot-v0.1.0-win-x64-portable.zip
+          if-no-files-found: error
