@@ -35,7 +35,7 @@ pub fn encode_bgra<W: Write>(mut out: W, width: u32, height: u32, bgra: &[u8]) -
     let mut line = vec![0u8; scanline_bytes];
     for row in bgra.chunks_exact(w * 4) {
         line[0] = 0; // PNG filter type None
-        for (rgb, px) in line[1..].chunks_exact_mut(3).zip(row.chunks_exact(4)) {
+        for (rgb, px) in line[1..].as_chunks_mut::<3>().0.iter_mut().zip(row.as_chunks::<4>().0.iter()) {
             rgb.copy_from_slice(&[px[2], px[1], px[0]]);
         }
         zlib.write_input(&line)?;
@@ -121,6 +121,7 @@ fn update_crc(mut crc: u32, bytes: &[u8]) -> u32 {
     crc
 }
 
+#[cfg(test)]
 fn crc32(bytes: &[u8]) -> u32 {
     !update_crc(!0u32, bytes)
 }
@@ -197,8 +198,8 @@ mod tests {
         let w=640usize;
         let h=150usize;
         let mut src=vec![0u8; w*h*4];
-        for (i, px) in src.chunks_exact_mut(4).enumerate() {
-            px.copy_from_slice(&[(i & 255) as u8, (i / 3 & 255) as u8, 81, 255]);
+        for (i, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            px.copy_from_slice(&[(i & 255) as u8, ((i / 3) & 255) as u8, 81, 255]);
         }
         let mut png=Vec::new();
         encode_bgra(&mut png,w as u32,h as u32,&src).unwrap();
