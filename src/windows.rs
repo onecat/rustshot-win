@@ -80,6 +80,7 @@ const CF_DIB: u32 = 8;
 const GMEM_MOVEABLE: u32 = 0x0002;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const MAX_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_CONCURRENT_SAVES: usize = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -867,20 +868,29 @@ fn finish_capture() {
     close_overlay();
     let Some((w, h, pixels)) = picture else { return; };
     let copied = put_clipboard(owner, w, h, &pixels);
+    // Reap completed workers and bound simultaneous full-resolution exports.
+    // When saving two screenshots is still in progress, wait for the oldest
+    // before starting another. This rare backpressure keeps memory bounded.
+    let oldest = APP.with(|cell| {
+        let mut app = cell.borrow_mut();
+        let mut i = 0;
+        while i < app.writers.len() {
+            if app.writers[i].is_finished() {
+                let completed = app.writers.remove(i);
+                let _ = completed.join();
+            } else { i += 1; }
+        }
+        if app.writers.len() >= MAX_CONCURRENT_SAVES {
+            Some(app.writers.remove(0))
+        } else { None }
+    });
+    if let Some(worker) = oldest { let _ = worker.join(); }
     let worker = thread::spawn(move || {
         if let Err(err) = save_png(w, h, &pixels) {
             alert(0, &format!("Screenshot was not saved: {err}"));
         }
     });
-    APP.with(|cell| {
-        let mut app = cell.borrow_mut();
-        let mut i = 0;
-        while i < app.writers.len() {
-            if app.writers[i].is_finished() { let finished = app.writers.remove(i); let _ = finished.join(); }
-            else { i += 1; }
-        }
-        app.writers.push(worker);
-    });
+    APP.with(|cell| cell.borrow_mut().writers.push(worker));
     if let Err(err) = copied { alert(owner, &format!("Clipboard copy failed; PNG save will still be attempted: {err}")); }
 }
 
