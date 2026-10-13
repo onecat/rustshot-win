@@ -1,6 +1,7 @@
 //! Minimal native Win32/GDI baseline for the first screenshot PoC.
 //! No external crates; unsafe FFI calls are isolated here. Windows 11 validation is pending.
 use crate::annotations::{self, Annotation, History, Tool};
+use std::os::windows::ffi::OsStrExt;
 use crate::geometry::{Point, Rect};
 use crate::selection::Handle as ResizeHandle;
 use crate::png;
@@ -31,10 +32,20 @@ const WS_EX_TOOLWINDOW: u32 = 0x00000080;
 const SW_SHOW: i32 = 5;
 const SW_HIDE: i32 = 0;
 const WM_DESTROY: u32 = 0x0002;
+const WM_CHAR: u32 = 0x0102;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_KEYDOWN: u32 = 0x0100;
+const WS_CHILD: u32 = 0x40000000;
+const WS_VISIBLE: u32 = 0x10000000;
+const WS_BORDER: u32 = 0x00800000;
+const ES_AUTOHSCROLL: u32 = 0x0080;
+const MF_CHECKED: u32 = 0x0008;
+const HKEY_CURRENT_USER: Handle = 0x80000001u32 as Handle;
+const REG_SZ: u32 = 1;
+const KEY_QUERY_VALUE: u32 = 0x0001;
+const KEY_SET_VALUE: u32 = 0x0002;
 const WM_HOTKEY: u32 = 0x0312;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -156,6 +167,8 @@ extern "system" {
     fn ReleaseCapture() -> i32;
     fn SetFocus(hwnd: Hwnd) -> Hwnd;
     fn GetKeyState(key: i32) -> i16;
+    fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
+    fn GetWindowTextW(hwnd: Hwnd, buf: *mut u16, capacity: i32) -> i32;
     fn EnumWindows(cb: Option<unsafe extern "system" fn(Hwnd, Lparam) -> i32>, lparam: Lparam) -> i32;
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
     fn IsIconic(hwnd: Hwnd) -> i32;
@@ -197,6 +210,10 @@ extern "system" {
     fn SetTextColor(dc: Hdc, color: u32) -> u32;
     fn SetBkMode(dc: Hdc, mode: i32) -> i32;
     fn TextOutW(dc: Hdc, x: i32, y: i32, text: *const u16, len: i32) -> i32;
+    fn CreateFontW(height: i32, width: i32, escapement: i32, orientation: i32,
+        weight: i32, italic: u32, underline: u32, strikeout: u32, charset: u32,
+        output_precision: u32, clip_precision: u32, quality: u32, pitch_family: u32,
+        face: *const u16) -> Hobj;
 }
 #[link(name = "shell32")]
 extern "system" {
@@ -216,6 +233,18 @@ extern "system" {
     fn GlobalFree(handle: Handle) -> Handle;
     fn GetLocalTime(time: *mut SystemTime);
     fn MoveFileW(existing: *const u16, new_path: *const u16) -> i32;
+}
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegCreateKeyExW(root: Handle, subkey: *const u16, reserved: u32,
+        class: *mut u16, options: u32, access: u32, security: *const c_void,
+        result: *mut Handle, disposition: *mut u32) -> u32;
+    fn RegQueryValueExW(key: Handle, name: *const u16, reserved: *mut u32,
+        value_type: *mut u32, data: *mut u8, size: *mut u32) -> u32;
+    fn RegSetValueExW(key: Handle, name: *const u16, reserved: u32, value_type: u32,
+        data: *const u8, size: u32) -> u32;
+    fn RegDeleteValueW(key: Handle, name: *const u16) -> u32;
+    fn RegCloseKey(key: Handle) -> u32;
 }
 #[link(name = "dwmapi")]
 extern "system" {
@@ -252,6 +281,8 @@ struct AppState {
     moving: bool,
     resizing: Option<ResizeHandle>,
     active_annotation: Option<Annotation>,
+    text_edit: Hwnd,
+    text_anchor: Point,
     tool: Tool,
     history: History,
     drag_anchor: Point,
@@ -262,7 +293,7 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
-            dragging: false, moving: false, resizing: None, active_annotation: None,
+            dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
             tool: Tool::Select, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, writers: Vec::new() }
     }
 }
@@ -342,7 +373,7 @@ fn local_pos(frame: &Frame, l: Lparam) -> Point {
     Point { x: frame.bounds.left + low_word_signed(l), y: frame.bounds.top + high_word_signed(l) }
 }
 fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
-    let width = 540.min(bounds.width().max(1));
+    let width = 630.min(bounds.width().max(1));
     let height = 34.min(bounds.height().max(1));
     let x = (selection.right - width).clamp(bounds.left, bounds.right - width);
     let proposed = selection.bottom + 7;
@@ -473,14 +504,16 @@ fn paint_overlay(hwnd: Hwnd) {
                     }
                     let labels = [
                         Tool::LABELS[0], Tool::LABELS[1], Tool::LABELS[2],
-                        Tool::LABELS[3], Tool::LABELS[4], "撤销", "重做", "完成", "取消",
+                        Tool::LABELS[3], Tool::LABELS[4], Tool::LABELS[5],
+                        Tool::LABELS[6], "撤销", "重做", "完成", "取消",
                     ];
                     SetBkMode(dc, TRANSPARENT);
                     for (index, label) in labels.iter().enumerate() {
-                        let left = bar.left + index as i32 * bar.width() / 9;
-                        let right = bar.left + (index as i32 + 1) * bar.width() / 9;
-                        if index < 5 && state.tool == [
-                            Tool::Select, Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Pen
+                        let left = bar.left + index as i32 * bar.width() / 11;
+                        let right = bar.left + (index as i32 + 1) * bar.width() / 11;
+                        if index < 7 && state.tool == [
+                            Tool::Select, Tool::Rectangle, Tool::Ellipse, Tool::Arrow,
+                            Tool::Pen, Tool::Text, Tool::Mosaic
                         ][index] {
                             let brush = CreateSolidBrush(0x00D5F4E4);
                             if brush != 0 {
@@ -489,7 +522,7 @@ fn paint_overlay(hwnd: Hwnd) {
                                 DeleteObject(brush);
                             }
                         }
-                        SetTextColor(dc, if index == 7 { 0x002A9B21 } else { 0x00555555 });
+                        SetTextColor(dc, if index == 9 { 0x002A9B21 } else { 0x00555555 });
                         let glyphs = utf16(label);
                         TextOutW(dc, left + 5, bar.top + 9, glyphs.as_ptr(), glyphs.len() as i32 - 1);
                     }
@@ -502,7 +535,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.1.0");
+    let title = utf16("RustShot v0.3.0");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }
@@ -541,6 +574,7 @@ fn close_overlay() {
         s.moving = false;
         s.resizing = None;
         s.active_annotation = None;
+        s.text_edit = 0;
         s.tool = Tool::Select;
         s.history.clear();
         std::mem::replace(&mut s.overlay, 0)
@@ -684,8 +718,8 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         if let Some(selection) = state.selected {
             let bar = toolbar_for(selection, bounds);
             if bar.contains(point) {
-                return ((i64::from(point.x - bar.left) * 9 / i64::from(bar.width())) as usize)
-                    .min(8) + 1;
+                return ((i64::from(point.x - bar.left) * 11 / i64::from(bar.width())) as usize)
+                    .min(10) + 1;
             }
         }
 
@@ -703,6 +737,8 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
                     state.moving = true;
                     state.drag_initial = selection;
                     state.history.clear();
+                } else if state.tool == Tool::Text {
+                    return 20;
                 } else {
                     state.active_annotation = Some(Annotation::begin(state.tool, point));
                 }
@@ -716,25 +752,27 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         0
     });
     match action {
-        1..=5 => {
+        1..=7 => {
             APP.with(|cell| {
                 cell.borrow_mut().tool = match action {
                     1 => Tool::Select, 2 => Tool::Rectangle, 3 => Tool::Ellipse,
-                    4 => Tool::Arrow, _ => Tool::Pen,
+                    4 => Tool::Arrow, 5 => Tool::Pen, 6 => Tool::Text,
+                    _ => Tool::Mosaic,
                 };
             });
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
-        6 => {
+        8 => {
             APP.with(|cell| { cell.borrow_mut().history.undo(); });
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
-        7 => {
+        9 => {
             APP.with(|cell| { cell.borrow_mut().history.redo(); });
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
-        8 => finish_capture(),
-        9 => close_overlay(),
+        10 => finish_capture(),
+        11 => close_overlay(),
+        20 => start_text_edit(hwnd),
         _ => { unsafe { SetCapture(hwnd); } }
     }
 }
