@@ -1,27 +1,32 @@
-# Build and GitHub publishing
+# Building RustShot on Windows 11
 
-This source tree is a local Git repository. The currently installed GitHub connector can update an existing repo but cannot create a new one. The owner account `onecat` has no accessible `rustshot-win` repository yet. No remote was silently created.
+**GitHub repository:** https://github.com/onecat/rustshot-win
 
-To create a **private** GitHub repository and publish this project with the GitHub CLI, from the project directory on a Windows machine with `gh` installed and logged in:
+## Obtain a CI-built test ZIP
 
-```powershell
-gh repo create onecat/rustshot-win --private --source . --remote origin --push
-```
+1. Open https://github.com/onecat/rustshot-win/actions/workflows/windows-ci.yml
+2. Select the latest **green** Windows workflow run.
+3. Under **Artifacts**, download `RustShot-v0.1.0-win-x64-portable`.
+4. Extract the Actions ZIP, then extract the contained `RustShot-v0.1.0-win-x64-portable.zip`.
+5. Run `RustShot.exe` on a Windows 11 x64 desktop. This binary is unsigned; review its provenance before allowing it to run.
 
-Or create an empty `rustshot-win` repo through https://github.com/new and run:
+CI baseline: https://github.com/onecat/rustshot-win/actions/runs/38368803609
+Rust 1.99.0 / Windows Server 2022: Clippy, unit tests, Windows MSVC release build and ZIP artifact passed. **No Windows 11 user-interface testing has yet been performed.**
 
-```powershell
-git remote add origin https://github.com/onecat/rustshot-win.git
-git push -u origin main
-```
-
-Then visit the GitHub **Actions** tab; the included Windows CI workflow will attempt to build and upload a portable ZIP. Do not trust the download until its run is green and actual Windows 11 interaction checks pass.
-
-To restore Git history from the bundled repository artifact:
+## Build from the repository
 
 ```powershell
-git clone .\\RustShot-initial.git.bundle rustshot-win
+git clone https://github.com/onecat/rustshot-win.git
 cd rustshot-win
+cargo build --release --target x86_64-pc-windows-msvc
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
-There are no remote dependencies or crates for this prototype. It requires the stable Windows MSVC Rust toolchain, Windows SDK and Visual Studio Build Tools.
+Requires a stable Rust MSVC toolchain, Visual Studio C++ Build Tools, and Windows SDK. The current PoC uses only the Windows system libraries and no Cargo dependencies.
+
+For screenshot testing, use Alt+A (or Ctrl+Shift+A when occupied), hover to select a window, drag to select an area, Enter to confirm, Esc to cancel. Files are saved under the Pictures known folder, subdirectory RustShot.
+
+## Release gate
+
+An Actions green check does **not** imply feature parity, security certification, measured resource usage or Windows 11 compatibility. The initial GDI screenshot backend remains provisional. Test multiple monitors, DPI scaling, protected windows, RDP, clipboard contention, screenshot rendering and repeated hotkey cycles on real Windows machines before declaring a stable release.

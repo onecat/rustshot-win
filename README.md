@@ -4,6 +4,15 @@ RustShot is a **new independent screenshot utility**, inspired by the familiar s
 
 **State: v0.1.0 PoC; not production ready and NOT feature-parity with WeChat.** This is the first executable code baseline, not the complete 5–8-week roadmap in [`docs/development-plan.md`](docs/development-plan.md).
 
+## Build verification (2026-10-13)
+
+- GitHub repository: https://github.com/onecat/rustshot-win
+- Windows CI baseline: https://github.com/onecat/rustshot-win/actions/runs/38368803609
+- Rust 1.99.0 on Windows Server 2022: Clippy, unit tests and x64 Release build **passed**.
+- Actions artifact: `RustShot-v0.1.0-win-x64-portable` (outer Actions ZIP contains the portable ZIP).
+- Executable is unsigned. Windows 11 interactive behavior, resource usage and screenshot correctness are **not yet verified**.
+- The workflow temporarily runs `cargo fmt` in the CI checkout; checked-in rustfmt enforcement is tracked as remaining cleanup.
+
 ## Current functionality (source implementation; Windows runtime not yet validated)
 
 - Single-instance system tray utility, with a hotkey `Alt+A` or fallback `Ctrl+Shift+A` if occupied.
