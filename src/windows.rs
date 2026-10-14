@@ -4,6 +4,7 @@ use crate::annotations::{self, Annotation, History, Tool};
 use std::os::windows::ffi::OsStrExt;
 use crate::geometry::{Point, Rect};
 use crate::selection::Handle as ResizeHandle;
+use crate::toolbar;
 use crate::png;
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -218,6 +219,7 @@ extern "system" {
     fn CreatePen(style: i32, width: i32, color: u32) -> Hobj;
     fn GetStockObject(index: i32) -> Hobj;
     fn Rectangle(dc: Hdc, l: i32, t: i32, r: i32, b: i32) -> i32;
+    fn RoundRect(dc: Hdc, l: i32, t: i32, r: i32, b: i32, ellipse_w: i32, ellipse_h: i32) -> i32;
     fn Ellipse(dc: Hdc, l: i32, t: i32, r: i32, b: i32) -> i32;
     fn MoveToEx(dc: Hdc, x: i32, y: i32, previous: *mut WinPoint) -> i32;
     fn LineTo(dc: Hdc, x: i32, y: i32) -> i32;
@@ -279,7 +281,6 @@ extern "system" {
 extern "system" { fn CoTaskMemFree(ptr: *mut c_void); }
 
 fn utf16(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
-fn win_rect(r: Rect) -> WinRect { WinRect { left: r.left, top: r.top, right: r.right, bottom: r.bottom } }
 fn low_word_signed(l: Lparam) -> i32 { l as u16 as i16 as i32 }
 fn high_word_signed(l: Lparam) -> i32 { (l >> 16) as u16 as i16 as i32 }
 fn bitmap_info(w: i32, h: i32) -> BitmapInfo {
@@ -305,6 +306,7 @@ struct AppState {
     text_anchor: Point,
     ime_composing: bool,
     tool: Tool,
+    toolbar_hover: Option<usize>,
     history: History,
     drag_anchor: Point,
     drag_initial: Rect,
@@ -317,7 +319,7 @@ impl AppState {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
             dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
             ime_composing: false,
-            tool: Tool::Select, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
+            tool: Tool::Select, toolbar_hover: None, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
     }
 }
 thread_local! { static APP: RefCell<AppState> = RefCell::new(AppState::new()); }
@@ -404,17 +406,7 @@ fn local_pos(frame: &Frame, l: Lparam) -> Point {
     }
 }
 fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
-    let width = 630.min(bounds.width().max(1));
-    let height = 34.min(bounds.height().max(1));
-    let x = selection.right.saturating_sub(width)
-        .clamp(bounds.left, bounds.right.saturating_sub(width));
-    let proposed = selection.bottom.saturating_add(7);
-    let y = if proposed.saturating_add(height) <= bounds.bottom {
-        proposed
-    } else {
-        selection.top.saturating_sub(7).saturating_sub(height).max(bounds.top)
-    };
-    Rect { left: x, top: y, right: x + width, bottom: y + height }
+    toolbar::rect_for(selection, bounds)
 }
 
 // Preview uses GDI for low allocation while editing. Export uses the same vector
@@ -648,6 +640,205 @@ thread_local! {
     static PAINT_SURFACE: RefCell<Option<PaintSurface>> = const { RefCell::new(None) };
 }
 
+// Native, self-drawn line icons: no bundled Tencent/WeChat assets.
+// The 11 action IDs map to existing RustShot tools, preserving behavior.
+unsafe fn toolbar_line(dc: Hdc, x1: i32, y1: i32, x2: i32, y2: i32) {
+    MoveToEx(dc, x1, y1, null_mut());
+    LineTo(dc, x2, y2);
+}
+
+unsafe fn toolbar_rounded(dc: Hdc, rect: Rect, radius: i32, fill: u32, outline: u32) {
+    let brush = CreateSolidBrush(fill);
+    let pen = CreatePen(PS_SOLID, 1, outline);
+    if brush != 0 && pen != 0 {
+        let old_brush = SelectObject(dc, brush);
+        let old_pen = SelectObject(dc, pen);
+        RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+    }
+    if pen != 0 { DeleteObject(pen); }
+    if brush != 0 { DeleteObject(brush); }
+}
+
+fn tool_for_action(action: usize) -> Option<Tool> {
+    match action {
+        1 => Some(Tool::Select),
+        2 => Some(Tool::Rectangle),
+        3 => Some(Tool::Ellipse),
+        4 => Some(Tool::Arrow),
+        5 => Some(Tool::Pen),
+        6 => Some(Tool::Text),
+        7 => Some(Tool::Mosaic),
+        _ => None,
+    }
+}
+
+unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, action: usize, disabled: bool) {
+    let cx = bounds.left + bounds.width() / 2;
+    let cy = bounds.top + bounds.height() / 2;
+    // COLORREF stores B, G, R. Keep red cancel and green confirm visible.
+    let color = if disabled { 0x00B7B7B7 } else {
+        match action {
+            10 => 0x0041B321, // green confirmation
+            11 => 0x004A4ADE, // red cancel
+            _ => 0x004A4A4A,
+        }
+    };
+    let pen = CreatePen(PS_SOLID, 2, color);
+    if pen == 0 { return; }
+    let old_pen = SelectObject(dc, pen);
+    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    match action {
+        1 => { // crop / selection
+            Rectangle(dc, cx - 8, cy - 7, cx + 9, cy + 8);
+            for (x, y) in [(cx - 8,cy - 7), (cx + 8,cy - 7),
+                (cx - 8,cy + 7),(cx + 8,cy + 7)] {
+                Rectangle(dc, x - 2, y - 2, x + 3, y + 3);
+            }
+        }
+        2 => { Rectangle(dc, cx - 9, cy - 8, cx + 10, cy + 9); }
+        3 => { Ellipse(dc, cx - 9, cy - 9, cx + 10, cy + 10); }
+        4 => { // arrow up and to right
+            toolbar_line(dc, cx - 9, cy + 8, cx + 8, cy - 9);
+            toolbar_line(dc, cx - 1, cy - 9, cx + 8, cy - 9);
+            toolbar_line(dc, cx + 8, cy - 9, cx + 8, cy);
+        }
+        5 => { // pen nib
+            toolbar_line(dc, cx - 9, cy + 8, cx + 4, cy - 5);
+            toolbar_line(dc, cx - 6, cy + 10, cx + 7, cy - 3);
+            toolbar_line(dc, cx + 4, cy - 5, cx + 7, cy - 3);
+            toolbar_line(dc, cx - 9, cy + 8, cx - 6, cy + 10);
+            toolbar_line(dc, cx + 5, cy - 7, cx + 8, cy - 10);
+        }
+        6 => { // letter T, deliberately not a text-label toolbar
+            let letter = utf16("T");
+            let face = utf16("Segoe UI");
+            let font = CreateFontW(23, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, face.as_ptr());
+            let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, color);
+            TextOutW(dc, cx - 6, cy - 12, letter.as_ptr(), 1);
+            if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
+        }
+        7 => { // pixelated mosaic
+            Rectangle(dc, cx - 9, cy - 9, cx + 10, cy + 10);
+            for y in 0..3 {
+                for x in 0..3 {
+                    let left = cx - 7 + x * 6;
+                    let top = cy - 7 + y * 6;
+                    if (x + y) % 2 == 0 {
+                        let b = CreateSolidBrush(color);
+                        if b != 0 {
+                            let tile = WinRect { left, top, right: left + 5, bottom: top + 5 };
+                            FillRect(dc, &tile, b);
+                            DeleteObject(b);
+                        }
+                    }
+                }
+            }
+        }
+        8 | 9 => { // mirrored undo / redo circular arrow
+            let direction = if action == 8 { 1 } else { -1 };
+            toolbar_line(dc, cx - 7 * direction, cy + 4, cx - 7 * direction, cy - 2);
+            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - direction, cy - 7);
+            toolbar_line(dc, cx - direction, cy - 7, cx + 6 * direction, cy - 5);
+            toolbar_line(dc, cx + 6 * direction, cy - 5, cx + 8 * direction, cy);
+            toolbar_line(dc, cx + 8 * direction, cy, cx + 4 * direction, cy + 6);
+            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - direction, cy - 1);
+            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - 6 * direction, cy - 8);
+        }
+        10 => { // confirm green check
+            toolbar_line(dc, cx - 9, cy, cx - 2, cy + 7);
+            toolbar_line(dc, cx - 2, cy + 7, cx + 10, cy - 8);
+        }
+        11 => { // cancel red X
+            toolbar_line(dc, cx - 8, cy - 8, cx + 8, cy + 8);
+            toolbar_line(dc, cx + 8, cy - 8, cx - 8, cy + 8);
+        }
+        _ => {}
+    }
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(pen);
+}
+
+fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
+    hover: Option<usize>, can_undo: bool, can_redo: bool) {
+    let bar = toolbar_for(selection, desktop);
+    let origin = Point { x: desktop.left, y: desktop.top };
+    let local = bar.translated(-origin.x, -origin.y);
+    unsafe {
+        // Rounded white toolbar with thin border and a gentle gray shadow.
+        let saved = SaveDC(dc);
+        if saved == 0 { return; }
+        toolbar_rounded(dc, Rect {
+            left: local.left + 1, top: local.top + 2,
+            right: local.right, bottom: local.bottom + 2,
+        }, 12, 0x00CACACA, 0x00CACACA);
+        toolbar_rounded(dc, local, 12, 0x00FFFFFF, 0x00DCDCDC);
+
+        for slot in 0..toolbar::BUTTON_COUNT {
+            let Some(cell) = toolbar::slot_rect(bar, slot) else { continue; };
+            let rect = cell.translated(-origin.x, -origin.y);
+            let action = toolbar::ACTIONS[slot];
+            let chosen = tool_for_action(action).is_some_and(|tool| tool == active);
+            let disabled = (action == 8 && !can_undo) || (action == 9 && !can_redo);
+            if chosen || hover == Some(slot) {
+                let padded = Rect { left: rect.left + 2, top: rect.top + 1,
+                    right: rect.right - 2, bottom: rect.bottom - 1 };
+                if !padded.is_empty() && padded.right > padded.left && padded.bottom > padded.top {
+                    let fill = if chosen { 0x00EAF7E8 } else { 0x00F3F3F3 };
+                    toolbar_rounded(dc, padded, 8, fill, fill);
+                }
+            }
+            draw_toolbar_icon(dc, rect, action, disabled);
+        }
+
+        for boundary in [(6,7), (8,9)] {
+            let (Some(a), Some(b)) = (toolbar::slot_rect(bar, boundary.0),
+                toolbar::slot_rect(bar, boundary.1)) else { continue; };
+            if a.right == b.left { continue; }
+            let x = (a.right + b.left) / 2 - origin.x;
+            let brush = CreateSolidBrush(0x00E5E5E5);
+            if brush != 0 {
+                let rect = WinRect { left: x, right: x + 1,
+                    top: local.top + 13, bottom: local.bottom - 13 };
+                FillRect(dc, &rect, brush);
+                DeleteObject(brush);
+            }
+        }
+
+        // Render the hover hint outside the bar, never over the button row.
+        if let Some(slot) = hover {
+            if let Some(cell) = toolbar::slot_rect(bar, slot) {
+                let label = toolbar::TITLES[slot];
+                let width = (label.chars().count() as i32 * 9 + 16).clamp(56, 165);
+                let tip_left = (cell.left + cell.width()/2 - width/2)
+                    .clamp(desktop.left, desktop.right.saturating_sub(width));
+                let y = if bar.top.saturating_sub(29) >= desktop.top {
+                    bar.top - 29
+                } else {
+                    bar.bottom.saturating_add(5).min(desktop.bottom.saturating_sub(24))
+                };
+                let tip = Rect { left: tip_left - origin.x, top: y - origin.y,
+                    right: tip_left + width - origin.x, bottom: y + 24 - origin.y };
+                toolbar_rounded(dc, tip, 7, 0x00444444, 0x00444444);
+                let glyphs = utf16(label);
+                let face = utf16("Microsoft YaHei UI");
+                let font = CreateFontW(16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, face.as_ptr());
+                let old = if font != 0 { SelectObject(dc, font) } else { 0 };
+                SetTextColor(dc, 0x00FFFFFF);
+                SetBkMode(dc, TRANSPARENT);
+                TextOutW(dc, tip.left + 8, tip.top + 3, glyphs.as_ptr(),
+                    glyphs.len() as i32 - 1);
+                if font != 0 { SelectObject(dc, old); DeleteObject(font); }
+            }
+        }
+        RestoreDC(dc, saved);
+    }
+}
+
 fn paint_overlay(hwnd: Hwnd) {
     // SAFETY: BeginPaint/EndPaint are paired; HDC is only used inside the paint call.
     unsafe {
@@ -711,36 +902,9 @@ fn paint_overlay(hwnd: Hwnd) {
                     if white != 0 { DeleteObject(white); }
                     if green != 0 { DeleteObject(green); }
 
-                    let bar = toolbar_for(selection, frame.bounds).translated(-frame.bounds.left, -frame.bounds.top);
-                    let background = CreateSolidBrush(0x00FAFAFA);
-                    if background != 0 {
-                        FillRect(dc, &win_rect(bar), background);
-                        DeleteObject(background);
-                    }
-                    let labels = [
-                        Tool::LABELS[0], Tool::LABELS[1], Tool::LABELS[2],
-                        Tool::LABELS[3], Tool::LABELS[4], Tool::LABELS[5],
-                        Tool::LABELS[6], "撤销", "重做", "完成", "取消",
-                    ];
-                    SetBkMode(dc, TRANSPARENT);
-                    for (index, label) in labels.iter().enumerate() {
-                        let left = bar.left + index as i32 * bar.width() / 11;
-                        let right = bar.left + (index as i32 + 1) * bar.width() / 11;
-                        if index < 7 && state.tool == [
-                            Tool::Select, Tool::Rectangle, Tool::Ellipse, Tool::Arrow,
-                            Tool::Pen, Tool::Text, Tool::Mosaic
-                        ][index] {
-                            let brush = CreateSolidBrush(0x00D5F4E4);
-                            if brush != 0 {
-                                FillRect(dc, &WinRect { left, top: bar.top, right,
-                                    bottom: bar.bottom }, brush);
-                                DeleteObject(brush);
-                            }
-                        }
-                        SetTextColor(dc, if index == 9 { 0x002A9B21 } else { 0x00555555 });
-                        let glyphs = utf16(label);
-                        TextOutW(dc, left + 5, bar.top + 9, glyphs.as_ptr(), glyphs.len() as i32 - 1);
-                    }
+                    draw_toolbar(dc, selection, frame.bounds, state.tool,
+                        state.toolbar_hover, !state.history.committed.is_empty(),
+                        !state.history.undone.is_empty());
                 }
             }
             if surface.is_some() {
@@ -814,6 +978,7 @@ fn close_overlay() {
         s.text_edit = 0;
         s.ime_composing = false;
         s.tool = Tool::Select;
+        s.toolbar_hover = None;
         s.history.clear();
         let previous = std::mem::replace(&mut s.restore_focus, 0);
         (std::mem::replace(&mut s.overlay, 0), previous)
@@ -1076,8 +1241,8 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         if let Some(selection) = state.selected {
             let bar = toolbar_for(selection, bounds);
             if bar.contains(point) {
-                return ((i64::from(point.x - bar.left) * 11 / i64::from(bar.width())) as usize)
-                    .min(10) + 1;
+                // The gaps between WeChat-style button groups are inert.
+                return toolbar::action_at(bar, point).unwrap_or(21);
             }
         }
 
@@ -1144,7 +1309,7 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
         let Some(frame) = &s.frame else { return false; };
         let point = local_pos(frame, l);
         let bounds = frame.bounds;
-        let before = (s.selected, s.hover,
+        let before = (s.selected, s.hover, s.toolbar_hover,
             s.active_annotation.as_ref().and_then(|a| a.points.last().copied()));
         if s.dragging {
             if let Some(annotation) = &mut s.active_annotation {
@@ -1161,7 +1326,12 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
         } else if s.selected.is_none() {
             s.hover = hit_test(frame, point);
         }
-        let after = (s.selected, s.hover,
+        s.toolbar_hover = if let Some(selection) = s.selected {
+            if !s.dragging {
+                toolbar::slot_at(toolbar_for(selection, bounds), point)
+            } else { None }
+        } else { None };
+        let after = (s.selected, s.hover, s.toolbar_hover,
             s.active_annotation.as_ref().and_then(|a| a.points.last().copied()));
         before != after
     });

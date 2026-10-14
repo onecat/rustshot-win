@@ -8,6 +8,8 @@ mod png;
 mod annotations;
 #[cfg(any(windows, test))]
 mod selection;
+#[cfg(any(windows, test))]
+mod toolbar;
 #[cfg(windows)]
 mod windows;
 
