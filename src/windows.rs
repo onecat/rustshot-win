@@ -28,6 +28,7 @@ const DIB_RGB_COLORS: u32 = 0;
 const BI_RGB: u32 = 0;
 const BLACKNESS: u32 = 0x00000042;
 const WS_POPUP: u32 = 0x80000000;
+const WS_CLIPCHILDREN: u32 = 0x02000000;
 const WS_EX_TOPMOST: u32 = 0x00000008;
 const WS_EX_TOOLWINDOW: u32 = 0x00000080;
 const SW_SHOW: i32 = 5;
@@ -782,7 +783,7 @@ fn start_capture() {
             let name = utf16("RustShotOverlay");
             // SAFETY: The class is registered in run() and the module instance remains loaded.
             let hwnd = unsafe { CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-                name.as_ptr(), name.as_ptr(), WS_POPUP,
+                name.as_ptr(), name.as_ptr(), WS_POPUP | WS_CLIPCHILDREN,
                 bounds.left, bounds.top, bounds.width(), bounds.height(), 0, 0, GetModuleHandleW(null()), null()) };
             if hwnd == 0 {
                 APP.with(|s| s.borrow_mut().frame = None);
@@ -1137,11 +1138,13 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
 }
 
 fn mouse_move(hwnd: Hwnd, l: Lparam) {
-    APP.with(|cell| {
+    let changed = APP.with(|cell| {
         let mut s = cell.borrow_mut();
-        let Some(frame) = &s.frame else { return; };
+        let Some(frame) = &s.frame else { return false; };
         let point = local_pos(frame, l);
         let bounds = frame.bounds;
+        let before = (s.selected, s.hover,
+            s.active_annotation.as_ref().and_then(|a| a.points.last().copied()));
         if s.dragging {
             if let Some(annotation) = &mut s.active_annotation {
                 annotation.update(point);
@@ -1157,8 +1160,13 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
         } else if s.selected.is_none() {
             s.hover = hit_test(frame, point);
         }
+        let after = (s.selected, s.hover,
+            s.active_annotation.as_ref().and_then(|a| a.points.last().copied()));
+        before != after
     });
-    unsafe { InvalidateRect(hwnd, null(), 0); }
+    // Moving inside the same hovered window is not a visual change.
+    // Skip full-desktop redraws when neither selection nor annotation changed.
+    if changed { unsafe { InvalidateRect(hwnd, null(), 0); } }
 }
 
 fn mouse_up(hwnd: Hwnd, l: Lparam) {
