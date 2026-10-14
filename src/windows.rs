@@ -692,8 +692,8 @@ unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, item: toolbar::Item) {
     let old_pen = SelectObject(dc, pen);
     let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
     match item.glyph {
-        G::Rectangle => Rectangle(dc, cx-size+1, cy-size+1, cx+size, cy+size),
-        G::Ellipse => Ellipse(dc, cx-size, cy-size, cx+size+1, cy+size+1),
+        G::Rectangle => { Rectangle(dc, cx-size+1, cy-size+1, cx+size, cy+size); }
+        G::Ellipse => { Ellipse(dc, cx-size, cy-size, cx+size+1, cy+size+1); }
         G::Emoji => {
             Ellipse(dc, cx-size, cy-size, cx+size+1, cy+size+1);
             let dot=CreateSolidBrush(color);
