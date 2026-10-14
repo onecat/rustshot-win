@@ -2,9 +2,9 @@
 
 Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workflow inspired by desktop WeChat screenshot selection. No Electron, WebView, cloud upload, telemetry, or administrator access is required.
 
-> **Current status: v0.5.0 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
+> **Current status: v0.6.0 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
 
-## Implemented through v0.5.0
+## Implemented through v0.6.0
 
 - Single-instance notification area app, `Alt+A` global shortcut (falls back to `Ctrl+Shift+A` if occupied).
 - Take a frozen desktop snapshot **before** displaying the darkened overlay; v0.4 uses a single full-desktop BGRA buffer plus an `AlphaBlend` 1×1 black source instead of keeping a second full-sized darkened BGRA image.
@@ -26,11 +26,11 @@ Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workfl
 
 ### Keyboard / mouse quick start
 
-1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.5.0-win-x64-portable` ZIP (or build it yourself) and start it.
+1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.6.0-win-x64-portable` ZIP (or build it yourself) and start it.
 2. Press `Alt+A` (or fallback `Ctrl+Shift+A`).
 3. Drag a screenshot rectangle or click a highlighted window.
 4. Drag the green handles to resize; drag inside the selected area to move.
-5. Use the **icon toolbar** beside the selection. Hover for Chinese tooltips; left group contains drawing tools, middle contains undo/redo, last two buttons are red Cancel and green Finish. For text, click once inside the selected area and enter text. `Ctrl+Z`/`Ctrl+Y` for history.
+5. Use the responsive **icon toolbar** beside the selection (V returns to selection mode). Hover for Chinese tooltips; left group contains drawing tools, middle contains undo/redo, last two buttons are red Cancel and green Finish. For text, click once inside the selected area and enter text. `Ctrl+Z`/`Ctrl+Y` for history.
 6. Press Enter or select **完成**. PNG is saved automatically and clipboard is populated independently. Esc/right-click cancels.
 
 **Note:** Moving or resizing the selection currently clears annotation history to prevent annotations being silently repositioned outside their original screen coordinates. Save your desired crop before drawing.
@@ -50,6 +50,21 @@ cargo build --release --target x86_64-pc-windows-msvc
 GitHub Actions builds with a `windows-2022` runner. A green CI run proves build, lint, and unit-test status; GitHub hosted runners cannot verify that global hotkeys, window enumeration, tray state, or screenshot rendering work on your Windows 11 desktop.
 
 
+
+
+### v0.6.0 user-reference UI reconstruction
+
+Rebuilt the visible overlay from **three screenshots provided by the user**: a 941×757 full-toolbar reference, an enlarged toolbar closeup and a 638×398 compact-toolbar reference. This version is intended to look much closer to WeChat for Windows, but it has **not yet been pixel-diff validated on the user's Windows 11 installation**.
+
+- Two size profiles rather than one generic bar: **824×52 pixels** when the virtual desktop is at least 900 physical pixels wide; **556×41 pixels** on narrower screens. Both clamp against virtual-desktop boundaries and flip above the selection if there is insufficient room beneath.
+- Reference-aligned fixed icon centers, gaps and separators; rectangular and elliptical outline icons, emoji, arrow, pen, mosaic, framed T, translation, OCR scan, scroll capture, undo, save, pin, share, red cancel X and green confirm.
+- The **16-item expanded** sequence matches the main reference: rectangle, ellipse, emoji, arrow, pen, mosaic, text, translation, OCR, scroll, undo, save, pin, share, cancel, finish. The **12-item compact** sequence omits secondary unavailable tools.
+- Green crop outline and **eight solid green squares**, with an upper-left `width x height` label, inspired by the supplied examples.
+- Disabled placeholders: emoji, translation, OCR, scrolling capture, pin and share. They are visibly gray, show a **暂未实现** tooltip and **do not capture the mouse** or alter selection state. The save icon is a real shortcut for the existing **save-and-complete** flow, not a separate export mode.
+- There is no visible Select icon in the WeChat reference. RustShot retains the selection/move tool by default and supports **V** to switch back to it after choosing a drawing tool. Ctrl+Y still redoes annotations even though the reference toolbar does not show a redo button.
+- The **v0.4.1 double-buffered, no-flicker overlay** and PNG/clipboard export code remain in place.
+
+This is an independently drawn interface; no copyrighted WeChat code or assets are packaged. It aims to reproduce the layout without promising exact typography or OS compositor/shadow pixels.
 
 ### v0.5.0 toolbar update and fidelity boundary
 

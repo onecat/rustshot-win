@@ -1,42 +1,86 @@
-//! Pixel-aligned toolbar layout and hit testing, independent of Win32 / GDI.
-//! We keep native physical coordinates and share the exact same cell
-//! definitions between painting, hover highlights and click dispatch.
+//! Screenshot toolbar geometry based on the user-provided WeChat PC captures.
+//! The actual icon and hit rectangles share these reference positions so hover,
+//! disabled buttons and clicks cannot drift. All units are physical pixels.
 use crate::geometry::{Point, Rect};
 
-pub const TOOLBAR_WIDTH: i32 = 428;
-pub const TOOLBAR_HEIGHT: i32 = 44;
-pub const BUTTON_COUNT: usize = 11;
+pub const FULL_WIDTH: i32 = 824;
+pub const FULL_HEIGHT: i32 = 52;
+pub const COMPACT_WIDTH: i32 = 556;
+pub const COMPACT_HEIGHT: i32 = 41;
 
-// Visual order resembles the WeChat desktop screenshot editor:
-// annotation actions, history, red cancel and green accept. These IDs preserve
-// v0.4's internal Win32 actions; do not bind behavior to visual position.
-pub const ACTIONS: [usize; BUTTON_COUNT] = [
-    2, // rectangle
-    3, // ellipse
-    4, // arrow
-    5, // freehand
-    7, // mosaic
-    6, // text
-    1, // selection
-    8, // undo
-    9, // redo
-    11, // cancel
-    10, // finish
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    Rectangle, Ellipse, Emoji, Arrow, Pen, Mosaic, Text, Translate, Ocr,
+    Scroll, Undo, Save, Pin, Share, Cancel, Finish,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Item {
+    pub glyph: Glyph,
+    pub label: &'static str,
+    // None is intentionally a disabled placeholder, never a fake click.
+    pub action: Option<usize>,
+}
+
+const FULL: [Item; 16] = [
+    Item { glyph: Glyph::Rectangle, label: "矩形", action: Some(2) },
+    Item { glyph: Glyph::Ellipse, label: "椭圆", action: Some(3) },
+    Item { glyph: Glyph::Emoji, label: "表情（暂未实现）", action: None },
+    Item { glyph: Glyph::Arrow, label: "箭头", action: Some(4) },
+    Item { glyph: Glyph::Pen, label: "画笔", action: Some(5) },
+    Item { glyph: Glyph::Mosaic, label: "马赛克", action: Some(7) },
+    Item { glyph: Glyph::Text, label: "文字", action: Some(6) },
+    Item { glyph: Glyph::Translate, label: "翻译（暂未实现）", action: None },
+    Item { glyph: Glyph::Ocr, label: "提取文字（暂未实现）", action: None },
+    Item { glyph: Glyph::Scroll, label: "滚动截图（暂未实现）", action: None },
+    Item { glyph: Glyph::Undo, label: "撤销 Ctrl+Z", action: Some(8) },
+    Item { glyph: Glyph::Save, label: "保存并完成", action: Some(10) },
+    Item { glyph: Glyph::Pin, label: "钉住（暂未实现）", action: None },
+    Item { glyph: Glyph::Share, label: "分享（暂未实现）", action: None },
+    Item { glyph: Glyph::Cancel, label: "取消 Esc", action: Some(11) },
+    Item { glyph: Glyph::Finish, label: "完成 Enter", action: Some(10) },
 ];
 
-pub const TITLES: [&str; BUTTON_COUNT] = [
-    "矩形", "椭圆", "箭头", "画笔", "马赛克", "文字", "选区",
-    "撤销 (Ctrl+Z)", "重做 (Ctrl+Y)", "取消 (Esc)", "完成 (Enter)",
+const COMPACT: [Item; 12] = [
+    FULL[0], FULL[1], FULL[2], FULL[3], FULL[4], FULL[5], FULL[6],
+    FULL[10], FULL[13], FULL[11], FULL[14], FULL[15],
 ];
+
+// Measured icon centers from the corresponding user references (within
+// the 824x52 and 556x41 bars). Keep fixed gaps and divider positions.
+const FULL_CENTERS: [i32; 16] =
+    [38, 84, 130, 178, 225, 272, 320, 386, 437, 485, 550, 597, 645, 691, 737, 784];
+const COMPACT_CENTERS: [i32; 12] =
+    [38, 80, 123, 168, 210, 252, 296, 339, 402, 444, 488, 530];
+const FULL_SEPARATORS: [(usize, usize); 2] = [(6, 7), (9, 10)];
+const COMPACT_SEPARATORS: [(usize, usize); 2] = [(6, 7), (7, 8)];
+
+pub fn is_compact(bounds: Rect) -> bool {
+    bounds.width() < 900
+}
+
+pub fn items(bar: Rect) -> &'static [Item] {
+    if bar.height() <= COMPACT_HEIGHT { &COMPACT } else { &FULL }
+}
+
+pub fn separators(bar: Rect) -> &'static [(usize, usize)] {
+    if bar.height() <= COMPACT_HEIGHT { &COMPACT_SEPARATORS } else { &FULL_SEPARATORS }
+}
 
 pub fn rect_for(selection: Rect, bounds: Rect) -> Rect {
-    let width = TOOLBAR_WIDTH.min(bounds.width().max(1));
-    let height = TOOLBAR_HEIGHT.min(bounds.height().max(1));
+    let small = is_compact(bounds);
+    let standard_w = if small { COMPACT_WIDTH } else { FULL_WIDTH };
+    let standard_h = if small { COMPACT_HEIGHT } else { FULL_HEIGHT };
+    let width = standard_w.min(bounds.width().max(1));
+    let height = standard_h.min(bounds.height().max(1));
+    // The reference places the bar adjacent to the crop's bottom edge and
+    // aligns its right edge to the crop's right edge when screen space allows.
     let x = selection.right.saturating_sub(width)
         .clamp(bounds.left, bounds.right.saturating_sub(width));
-    let proposed = selection.bottom.saturating_add(8);
-    let y = if proposed.saturating_add(height) <= bounds.bottom {
-        proposed
+    let gap = if small { 3 } else { 14 };
+    let below = selection.bottom.saturating_add(gap);
+    let y = if below.saturating_add(height) <= bounds.bottom {
+        below
     } else {
         selection.top.saturating_sub(height.saturating_add(8))
             .clamp(bounds.top, bounds.bottom.saturating_sub(height))
@@ -44,84 +88,112 @@ pub fn rect_for(selection: Rect, bounds: Rect) -> Rect {
     Rect { left: x, top: y, right: x + width, bottom: y + height }
 }
 
-fn compact(bar: Rect) -> bool {
-    bar.width() < TOOLBAR_WIDTH
-}
-
 pub fn slot_rect(bar: Rect, slot: usize) -> Option<Rect> {
-    if slot >= BUTTON_COUNT || bar.is_empty() { return None; }
-    let small = compact(bar);
-    let padding = if small { 1 } else { 8 };
-    let group_spacing = if small { 0 } else { 8 };
-    let usable = bar.width() - 2 * padding - group_spacing * 2;
-    let cell = (usable / BUTTON_COUNT as i32).max(1);
-    let group = if slot >= 9 { 2 } else if slot >= 7 { 1 } else { 0 };
-    let left = bar.left + padding + slot as i32 * cell + group * group_spacing;
-    let right = (left + cell).min(bar.right);
-    let top = bar.top + (if bar.height() > 16 { 4 } else { 0 });
-    let bottom = bar.bottom - (if bar.height() > 16 { 4 } else { 0 });
+    if bar.is_empty() { return None; }
+    let small = bar.height() <= COMPACT_HEIGHT;
+    let (centers, standard_width, cell_width): (&[i32], i32, i32) = if small {
+        (&COMPACT_CENTERS, COMPACT_WIDTH, 36)
+    } else {
+        (&FULL_CENTERS, FULL_WIDTH, 42)
+    };
+    let center = *centers.get(slot)?;
+    // Scale only for unusually narrow desktops, keeping exact pixels for
+    // normal reference-sized bars.
+    let left = bar.left + ((center - cell_width/2) as i64 * bar.width() as i64
+        / standard_width as i64) as i32;
+    let right = bar.left + ((center + cell_width/2) as i64 * bar.width() as i64
+        / standard_width as i64) as i32;
+    let inset = if bar.height() > 16 { 3 } else { 0 };
+    let top = bar.top + inset;
+    let bottom = bar.bottom - inset;
     (right > left && bottom > top).then_some(Rect { left, top, right, bottom })
 }
 
-pub fn slot_at(bar: Rect, p: Point) -> Option<usize> {
-    if !bar.contains(p) { return None; }
-    (0..BUTTON_COUNT).find(|&slot| slot_rect(bar, slot).is_some_and(|r| r.contains(p)))
+pub fn slot_at(bar: Rect, point: Point) -> Option<usize> {
+    if !bar.contains(point) { return None; }
+    items(bar).iter().enumerate()
+        .find(|(i, _)| slot_rect(bar, *i).is_some_and(|r| r.contains(point)))
+        .map(|(i, _)| i)
 }
 
-pub fn action_at(bar: Rect, p: Point) -> Option<usize> {
-    slot_at(bar, p).map(|index| ACTIONS[index])
+pub fn action_at(bar: Rect, point: Point) -> Option<usize> {
+    slot_at(bar, point).and_then(|slot| items(bar)[slot].action)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn bounds() -> Rect {
-        Rect { left: -1920, top: -200, right: 1920, bottom: 1080 }
+    fn desktop(width: i32) -> Rect {
+        Rect { left: -100, top: 0, right: width - 100, bottom: 1000 }
     }
 
     #[test]
-    fn action_mapping_matches_real_toolbar_behavior() {
-        let bar = rect_for(Rect { left: -500, top: 20, right: 700, bottom: 350 }, bounds());
-        assert_eq!(bar.width(), TOOLBAR_WIDTH);
-        assert_eq!(bar.height(), TOOLBAR_HEIGHT);
-        for (i, action) in ACTIONS.iter().enumerate() {
+    fn full_layout_matches_user_image_and_actions() {
+        let bounds = desktop(1920);
+        let sel = Rect { left: 100, top: 40, right: 1000, bottom: 500 };
+        let bar = rect_for(sel, bounds);
+        assert_eq!((bar.width(), bar.height(), bar.top), (824, 52, 514));
+        assert_eq!(items(bar).len(), 16);
+        for (i, item) in items(bar).iter().enumerate() {
             let cell = slot_rect(bar, i).unwrap();
-            let mid = Point { x: (cell.left + cell.right) / 2, y: (cell.top + cell.bottom) / 2 };
+            let mid = Point { x: (cell.left+cell.right)/2, y: (cell.top+cell.bottom)/2 };
             assert_eq!(slot_at(bar, mid), Some(i));
-            assert_eq!(action_at(bar, mid), Some(*action));
+            assert_eq!(action_at(bar, mid), item.action);
         }
-        assert_eq!(ACTIONS[9], 11); // red X cancels
-        assert_eq!(ACTIONS[10], 10); // green check finishes
+        assert_eq!(items(bar)[14].glyph, Glyph::Cancel);
+        assert_eq!(items(bar)[15].action, Some(10));
+        assert_eq!(items(bar)[8].action, None);
     }
 
     #[test]
-    fn separators_are_not_clickable() {
-        let bar = rect_for(Rect { left: 0, top: 0, right: 600, bottom: 200 }, bounds());
-        let left = slot_rect(bar, 6).unwrap();
-        let right = slot_rect(bar, 7).unwrap();
-        assert!(right.left > left.right);
-        assert_eq!(slot_at(bar, Point { x: left.right + 2, y: bar.top + 16 }), None);
+    fn compact_layout_matches_narrow_reference_and_has_real_functions() {
+        let bounds = desktop(638);
+        let sel = Rect { left: 20, top: 30, right: 505, bottom: 334 };
+        let bar = rect_for(sel, bounds);
+        assert_eq!(bar.width(), 556);
+        assert_eq!(bar.height(), 41);
+        assert_eq!(bar.top, 337);
+        assert_eq!(items(bar).len(), 12);
+        for (i, item) in items(bar).iter().enumerate() {
+            let rect = slot_rect(bar, i).unwrap();
+            let center = Point { x: (rect.left+rect.right)/2, y: (rect.top+rect.bottom)/2 };
+            assert_eq!(action_at(bar, center), item.action);
+        }
+        assert_eq!(items(bar)[8].glyph, Glyph::Share);
+        assert_eq!(items(bar)[9].glyph, Glyph::Save);
     }
 
     #[test]
-    fn above_bottom_edge_and_negative_screen_coordinates() {
-        let bar = rect_for(Rect { left: -1900, top: 950, right: -1700, bottom: 1070 }, bounds());
-        assert!(bar.top >= bounds().top);
-        assert!(bar.bottom <= 950);
-        assert!(bar.left >= bounds().left);
+    fn no_action_from_disabled_or_separator_gap() {
+        let bar = rect_for(Rect { left: 10, top: 0, right: 900, bottom: 300 }, desktop(1920));
+        let x = slot_rect(bar, 2).unwrap();
+        assert_eq!(action_at(bar, Point { x: (x.left+x.right)/2, y: x.top+5 }), None);
+        let before = slot_rect(bar, 6).unwrap();
+        let after = slot_rect(bar, 7).unwrap();
+        assert!(after.left > before.right);
+        let gap = Point { x: (before.right+after.left)/2, y: (bar.top+bar.bottom)/2 };
+        assert_eq!(action_at(bar, gap), None);
     }
 
     #[test]
-    fn compact_virtual_desktop_is_bounded() {
-        let virtual_screen = Rect { left: -90, top: -30, right: 90, bottom: 70 };
-        let selection = Rect { left: -75, top: -20, right: 80, bottom: 35 };
-        let bar = rect_for(selection, virtual_screen);
+    fn negative_coordinates_and_above_screen_bottom() {
+        let bounds = Rect { left: -1920, top: -300, right: 2560, bottom: 1080 };
+        let selected = Rect { left: -1200, top: 900, right: -400, bottom: 1060 };
+        let bar = rect_for(selected, bounds);
+        assert!(bar.top < selected.top);
+        assert!(bar.left >= bounds.left && bar.right <= bounds.right);
+    }
+
+    #[test]
+    fn tiny_desktop_still_keeps_hit_rectangles_bounded() {
+        let bounds = Rect { left: -90, top: -30, right: 90, bottom: 70 };
+        let selected = Rect { left: -85, top: -20, right: 80, bottom: 25 };
+        let bar = rect_for(selected, bounds);
         assert_eq!(bar.width(), 180);
-        for index in 0..BUTTON_COUNT {
-            let rect = slot_rect(bar, index).unwrap();
-            assert!(rect.left >= virtual_screen.left && rect.right <= virtual_screen.right);
+        for i in 0..items(bar).len() {
+            let item = slot_rect(bar, i).unwrap();
+            assert!(item.left >= bounds.left && item.right <= bounds.right);
         }
-        assert_eq!(slot_at(bar, Point { x: bar.right, y: bar.bottom }), None);
     }
 }
