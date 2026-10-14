@@ -64,6 +64,7 @@ const VK_RETURN: usize = 13;
 const VK_CONTROL: i32 = 17;
 const VK_Z: usize = 0x5A;
 const VK_Y: usize = 0x59;
+const VK_V: usize = 0x56;
 const MOD_ALT: u32 = 0x0001;
 const MOD_CONTROL: u32 = 0x0002;
 const MOD_SHIFT: u32 = 0x0004;
@@ -1395,6 +1396,7 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         10 => finish_capture(),
         11 => close_overlay(),
         20 => start_text_edit(hwnd),
+        21 => {}, // disabled toolbar items / group separators are inert
         _ => { unsafe { SetCapture(hwnd); } }
     }
 }
@@ -1470,6 +1472,11 @@ unsafe extern "system" fn overlay_proc(hwnd: Hwnd, message: u32, w: Wparam, l: L
                 if w == VK_Z { cell.borrow_mut().history.undo(); }
                 else { cell.borrow_mut().history.redo(); }
             });
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_KEYDOWN if w == VK_V => {
+            APP.with(|cell| cell.borrow_mut().tool = Tool::Select);
             InvalidateRect(hwnd, null(), 0);
             0
         }
