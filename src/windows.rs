@@ -581,7 +581,7 @@ fn draw_dimming_layer(target: Hdc, width: i32, height: i32) {
             PatBlt(source, 0, 0, 1, 1, BLACKNESS);
             AlphaBlend(target, 0, 0, width, height, source, 0, 0, 1, 1,
                 BlendFunction { blend_op: 0, blend_flags: 0,
-                    constant_alpha: 110, alpha_format: 0 });
+                    constant_alpha: 136, alpha_format: 0 });
             SelectObject(source, previous);
         }
         DeleteObject(bitmap);
