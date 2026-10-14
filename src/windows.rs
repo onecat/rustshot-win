@@ -955,38 +955,48 @@ fn paint_overlay(hwnd: Hwnd) {
                 StretchDIBits(dc, rel.left, rel.top, rel.width(), rel.height(),
                     rel.left, rel.top, rel.width(), rel.height(),
                     frame.pixels.as_ptr() as *const c_void, &info, DIB_RGB_COLORS, SRCCOPY);
-                let pen = CreatePen(PS_SOLID, 2, 0x0045C62A); // COLORREF BGR green
-                let old_pen = SelectObject(dc, pen);
-                let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                Rectangle(dc, rel.left, rel.top, rel.right, rel.bottom);
-                SelectObject(dc, old_brush);
-                SelectObject(dc, old_pen);
-                DeleteObject(pen);
+                // Match the reference green crop stroke and eight small solid
+                // edge handles; the old white squares were visibly incorrect.
+                let border_color = if toolbar::is_compact(frame.bounds) {
+                    0x0019AD1A // RGB(26,173,25): compact reference
+                } else {
+                    0x0080BC5F // RGB(95,188,128): wide reference
+                };
+                let pen = CreatePen(PS_SOLID, 2, border_color);
+                if pen != 0 {
+                    let old_pen = SelectObject(dc, pen);
+                    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                    Rectangle(dc, rel.left, rel.top, rel.right, rel.bottom);
+                    SelectObject(dc, old_brush);
+                    SelectObject(dc, old_pen);
+                    DeleteObject(pen);
+                }
+                // Screenshot reference: small 1693 x 1185 at the upper-left.
                 SetBkMode(dc, TRANSPARENT);
                 SetTextColor(dc, 0x00FFFFFF);
-                let title = format!("{} × {}", selection.width(), selection.height());
-                let text = utf16(&title);
-                TextOutW(dc, rel.left + 2, (rel.top - 20).max(0), text.as_ptr(), text.len() as i32 - 1);
+                let caption = format!("{} x {}", selection.width(), selection.height());
+                let label = utf16(&caption);
+                let face = utf16("Segoe UI");
+                let font = CreateFontW(14,0,0,0,400,0,0,0,1,0,0,4,0,face.as_ptr());
+                let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
+                TextOutW(dc, rel.left + 1, rel.top.saturating_sub(19).max(0),
+                    label.as_ptr(), label.len() as i32 - 1);
+                if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
                 if state.selected.is_some() {
-                    paint_annotations(dc, frame,
-                        selection, &state.history,
+                    paint_annotations(dc, frame, selection, &state.history,
                         state.active_annotation.as_ref());
-                    let white = CreateSolidBrush(0x00FFFFFF);
-                    let green = CreatePen(PS_SOLID, 1, 0x0045C62A);
-                    if white != 0 && green != 0 {
-                        let old_pen = SelectObject(dc, green);
+                    let handle_brush = CreateSolidBrush(border_color);
+                    if handle_brush != 0 {
                         for handle in ResizeHandle::ALL {
                             let center = handle.center(selection);
                             let x = center.x - frame.bounds.left;
                             let y = center.y - frame.bounds.top;
-                            let square = WinRect { left: x - 4, top: y - 4, right: x + 5, bottom: y + 5 };
-                            FillRect(dc, &square, white);
-                            Rectangle(dc, square.left, square.top, square.right, square.bottom);
+                            let mark = WinRect { left: x - 3, top: y - 3,
+                                right: x + 4, bottom: y + 4 };
+                            FillRect(dc, &mark, handle_brush);
                         }
-                        SelectObject(dc, old_pen);
+                        DeleteObject(handle_brush);
                     }
-                    if white != 0 { DeleteObject(white); }
-                    if green != 0 { DeleteObject(green); }
 
                     draw_toolbar(dc, selection, frame.bounds, state.tool,
                         state.toolbar_hover, !state.history.committed.is_empty(),
@@ -1012,7 +1022,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.4.1");
+    let title = utf16("RustShot v0.6.0");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }
