@@ -932,8 +932,11 @@ fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
         if let Some(index) = hover {
             if let Some(cell) = toolbar::slot_rect(bar, index) {
                 let label = all[index].label;
-                let characters = label.chars().count() as i32;
-                let width = (characters * 9 + 20).clamp(62, 230).min(desktop.width());
+                // Chinese glyphs are much wider than ASCII at -16 character
+                // height; avoid clipping longer disabled-action tooltips.
+                let text_width: i32 = label.chars()
+                    .map(|ch| if ch.is_ascii() { 9 } else { 17 }).sum();
+                let width = (text_width + 20).clamp(62, 260).min(desktop.width());
                 let left = (cell.left + cell.width()/2 - width/2)
                     .clamp(desktop.left, desktop.right.saturating_sub(width));
                 let y = if bar.bottom.saturating_add(33) <= desktop.bottom {
