@@ -2,15 +2,16 @@
 
 Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workflow inspired by desktop WeChat screenshot selection. No Electron, WebView, cloud upload, telemetry, or administrator access is required.
 
-> **Current status: v0.4.1 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
+> **Current status: v0.5.0 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
 
-## Implemented through v0.4.1
+## Implemented through v0.5.0
 
 - Single-instance notification area app, `Alt+A` global shortcut (falls back to `Ctrl+Shift+A` if occupied).
 - Take a frozen desktop snapshot **before** displaying the darkened overlay; v0.4 uses a single full-desktop BGRA buffer plus an `AlphaBlend` 1×1 black source instead of keeping a second full-sized darkened BGRA image.
 - Hover-detect top-level visible windows, click to select one, or drag to create an arbitrary selection.
 - Drag the selected region to move; **8 handles** let you resize every edge and corner.
-- Floating Chinese-language toolbar: **Selection / Rectangle / Ellipse / Arrow / Freehand pen / Text / Mosaic / Undo / Redo / Finish / Cancel**.
+- **v0.5 icon-based native floating toolbar** visually inspired by desktop WeChat 4.x: white rounded background, thin gray outline and shadow, monochrome vector icons, section separators, subtle green active state, hover background and Chinese hover tips, red Cancel and green Finish. Buttons are aligned at the bottom-right of the selection with automatic above-selection fallback.
+- 11 real toolbar actions: Rectangle / Ellipse / Arrow / Pen / Mosaic / Text / Select / Undo / Redo / Cancel / Finish. Tooltips are informational only; unsupported actions are intentionally not displayed.
 - Draw annotation overlays with non-destructive history. `Ctrl+Z` and `Ctrl+Y` undo/redo.
 - Text uses a native Unicode input control with Windows IME support: click within the selected area, type, press **Enter** to commit or **Esc** to cancel. Labels are drawn onto both PNG and clipboard output using GDI.
 - Pixelated mosaic: drag a rectangle over sensitive details. 12×12 physical-pixel averaging; rectangles clip strictly inside the selected region.
@@ -25,11 +26,11 @@ Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workfl
 
 ### Keyboard / mouse quick start
 
-1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.4.1-win-x64-portable` ZIP (or build it yourself) and start it.
+1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.5.0-win-x64-portable` ZIP (or build it yourself) and start it.
 2. Press `Alt+A` (or fallback `Ctrl+Shift+A`).
 3. Drag a screenshot rectangle or click a highlighted window.
 4. Drag the green handles to resize; drag inside the selected area to move.
-5. Use the floating toolbar to select a drawing tool, then drag inside the selection to annotate. For text, click once, type in the native text input, press Enter to add the label. `Ctrl+Z`/`Ctrl+Y` for history.
+5. Use the **icon toolbar** beside the selection. Hover for Chinese tooltips; left group contains drawing tools, middle contains undo/redo, last two buttons are red Cancel and green Finish. For text, click once inside the selected area and enter text. `Ctrl+Z`/`Ctrl+Y` for history.
 6. Press Enter or select **完成**. PNG is saved automatically and clipboard is populated independently. Esc/right-click cancels.
 
 **Note:** Moving or resizing the selection currently clears annotation history to prevent annotations being silently repositioned outside their original screen coordinates. Save your desired crop before drawing.
@@ -48,6 +49,13 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 GitHub Actions builds with a `windows-2022` runner. A green CI run proves build, lint, and unit-test status; GitHub hosted runners cannot verify that global hotkeys, window enumeration, tray state, or screenshot rendering work on your Windows 11 desktop.
 
+
+
+### v0.5.0 toolbar update and fidelity boundary
+
+The former plain Chinese-text button row has been replaced with a compact **428×44 physical-pixel** custom-drawn toolbar on standard-sized screens; it becomes narrower on constrained desktops. Geometry, hover hit testing and click actions now share a single tested layout module (`src/toolbar.rs`). There is **no Electron/WebView** and no brand assets copied from WeChat.
+
+Visual references are taken from published desktop WeChat 4.x screenshots, **not** from a pixel-perfect image of the user's installed version. Spacing, exact vector strokes, user-configurable line/color palette, emoji, scrolling capture and newer WeChat-only actions need further design and implementation. The non-flickering v0.4.1 double-buffered screenshot overlay is retained unchanged.
 
 ### v0.4.1 flicker hotfix
 
