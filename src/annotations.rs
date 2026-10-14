@@ -13,9 +13,6 @@ pub enum Tool {
     Mosaic,
 }
 
-impl Tool {
-    pub const LABELS: [&'static str; 7] = ["选区", "矩形", "椭圆", "箭头", "画笔", "文字", "马赛克"];
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Annotation {
