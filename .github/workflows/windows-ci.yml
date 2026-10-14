@@ -1,7 +1,7 @@
 name: Windows CI and portable screenshot
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main, "feature/**", "fix/**"]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -30,9 +30,9 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/rustshot.exe dist/RustShot.exe
           Copy-Item README.md dist/README.txt
-          Compress-Archive -Path dist/* -DestinationPath RustShot-v0.4.0-win-x64-portable.zip
+          Compress-Archive -Path dist/* -DestinationPath RustShot-v0.4.1-win-x64-portable.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: RustShot-v0.4.0-win-x64-portable
-          path: RustShot-v0.4.0-win-x64-portable.zip
+          name: RustShot-v0.4.1-win-x64-portable
+          path: RustShot-v0.4.1-win-x64-portable.zip
           if-no-files-found: error
