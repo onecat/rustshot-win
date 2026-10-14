@@ -641,6 +641,205 @@ thread_local! {
     static PAINT_SURFACE: RefCell<Option<PaintSurface>> = const { RefCell::new(None) };
 }
 
+// Native, self-drawn line icons: no bundled Tencent/WeChat assets.
+// The 11 action IDs map to existing RustShot tools, preserving behavior.
+unsafe fn toolbar_line(dc: Hdc, x1: i32, y1: i32, x2: i32, y2: i32) {
+    MoveToEx(dc, x1, y1, null_mut());
+    LineTo(dc, x2, y2);
+}
+
+unsafe fn toolbar_rounded(dc: Hdc, rect: Rect, radius: i32, fill: u32, outline: u32) {
+    let brush = CreateSolidBrush(fill);
+    let pen = CreatePen(PS_SOLID, 1, outline);
+    if brush != 0 && pen != 0 {
+        let old_brush = SelectObject(dc, brush);
+        let old_pen = SelectObject(dc, pen);
+        RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+    }
+    if pen != 0 { DeleteObject(pen); }
+    if brush != 0 { DeleteObject(brush); }
+}
+
+fn tool_for_action(action: usize) -> Option<Tool> {
+    match action {
+        1 => Some(Tool::Select),
+        2 => Some(Tool::Rectangle),
+        3 => Some(Tool::Ellipse),
+        4 => Some(Tool::Arrow),
+        5 => Some(Tool::Pen),
+        6 => Some(Tool::Text),
+        7 => Some(Tool::Mosaic),
+        _ => None,
+    }
+}
+
+unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, action: usize, disabled: bool) {
+    let cx = bounds.left + bounds.width() / 2;
+    let cy = bounds.top + bounds.height() / 2;
+    // COLORREF stores B, G, R. Keep red cancel and green confirm visible.
+    let color = if disabled { 0x00B7B7B7 } else {
+        match action {
+            10 => 0x0041B321, // green confirmation
+            11 => 0x004A4ADE, // red cancel
+            _ => 0x004A4A4A,
+        }
+    };
+    let pen = CreatePen(PS_SOLID, 2, color);
+    if pen == 0 { return; }
+    let old_pen = SelectObject(dc, pen);
+    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    match action {
+        1 => { // crop / selection
+            Rectangle(dc, cx - 8, cy - 7, cx + 9, cy + 8);
+            for (x, y) in [(cx - 8,cy - 7), (cx + 8,cy - 7),
+                (cx - 8,cy + 7),(cx + 8,cy + 7)] {
+                Rectangle(dc, x - 2, y - 2, x + 3, y + 3);
+            }
+        }
+        2 => { Rectangle(dc, cx - 9, cy - 8, cx + 10, cy + 9); }
+        3 => { Ellipse(dc, cx - 9, cy - 9, cx + 10, cy + 10); }
+        4 => { // arrow up and to right
+            toolbar_line(dc, cx - 9, cy + 8, cx + 8, cy - 9);
+            toolbar_line(dc, cx - 1, cy - 9, cx + 8, cy - 9);
+            toolbar_line(dc, cx + 8, cy - 9, cx + 8, cy);
+        }
+        5 => { // pen nib
+            toolbar_line(dc, cx - 9, cy + 8, cx + 4, cy - 5);
+            toolbar_line(dc, cx - 6, cy + 10, cx + 7, cy - 3);
+            toolbar_line(dc, cx + 4, cy - 5, cx + 7, cy - 3);
+            toolbar_line(dc, cx - 9, cy + 8, cx - 6, cy + 10);
+            toolbar_line(dc, cx + 5, cy - 7, cx + 8, cy - 10);
+        }
+        6 => { // letter T, deliberately not a text-label toolbar
+            let letter = utf16("T");
+            let face = utf16("Segoe UI");
+            let font = CreateFontW(23, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, face.as_ptr());
+            let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, color);
+            TextOutW(dc, cx - 6, cy - 12, letter.as_ptr(), 1);
+            if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
+        }
+        7 => { // pixelated mosaic
+            Rectangle(dc, cx - 9, cy - 9, cx + 10, cy + 10);
+            for y in 0..3 {
+                for x in 0..3 {
+                    let left = cx - 7 + x * 6;
+                    let top = cy - 7 + y * 6;
+                    if (x + y) % 2 == 0 {
+                        let b = CreateSolidBrush(color);
+                        if b != 0 {
+                            let tile = WinRect { left, top, right: left + 5, bottom: top + 5 };
+                            FillRect(dc, &tile, b);
+                            DeleteObject(b);
+                        }
+                    }
+                }
+            }
+        }
+        8 | 9 => { // mirrored undo / redo circular arrow
+            let direction = if action == 8 { 1 } else { -1 };
+            toolbar_line(dc, cx - 7 * direction, cy + 4, cx - 7 * direction, cy - 2);
+            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - 1 * direction, cy - 7);
+            toolbar_line(dc, cx - 1 * direction, cy - 7, cx + 6 * direction, cy - 5);
+            toolbar_line(dc, cx + 6 * direction, cy - 5, cx + 8 * direction, cy);
+            toolbar_line(dc, cx + 8 * direction, cy, cx + 4 * direction, cy + 6);
+            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - 1 * direction, cy - 1);
+            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - 6 * direction, cy - 8);
+        }
+        10 => { // confirm green check
+            toolbar_line(dc, cx - 9, cy, cx - 2, cy + 7);
+            toolbar_line(dc, cx - 2, cy + 7, cx + 10, cy - 8);
+        }
+        11 => { // cancel red X
+            toolbar_line(dc, cx - 8, cy - 8, cx + 8, cy + 8);
+            toolbar_line(dc, cx + 8, cy - 8, cx - 8, cy + 8);
+        }
+        _ => {}
+    }
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(pen);
+}
+
+fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
+    hover: Option<usize>, can_undo: bool, can_redo: bool) {
+    let bar = toolbar_for(selection, desktop);
+    let origin = Point { x: desktop.left, y: desktop.top };
+    let local = bar.translated(-origin.x, -origin.y);
+    unsafe {
+        // Rounded white toolbar with thin border and a gentle gray shadow.
+        let saved = SaveDC(dc);
+        if saved == 0 { return; }
+        toolbar_rounded(dc, Rect {
+            left: local.left + 1, top: local.top + 2,
+            right: local.right, bottom: local.bottom + 2,
+        }, 12, 0x00CACACA, 0x00CACACA);
+        toolbar_rounded(dc, local, 12, 0x00FFFFFF, 0x00DCDCDC);
+
+        for slot in 0..toolbar::BUTTON_COUNT {
+            let Some(cell) = toolbar::slot_rect(bar, slot) else { continue; };
+            let rect = cell.translated(-origin.x, -origin.y);
+            let action = toolbar::ACTIONS[slot];
+            let chosen = tool_for_action(action).is_some_and(|tool| tool == active);
+            let disabled = (action == 8 && !can_undo) || (action == 9 && !can_redo);
+            if chosen || hover == Some(slot) {
+                let padded = Rect { left: rect.left + 2, top: rect.top + 1,
+                    right: rect.right - 2, bottom: rect.bottom - 1 };
+                if !padded.is_empty() && padded.right > padded.left && padded.bottom > padded.top {
+                    let fill = if chosen { 0x00EAF7E8 } else { 0x00F3F3F3 };
+                    toolbar_rounded(dc, padded, 8, fill, fill);
+                }
+            }
+            draw_toolbar_icon(dc, rect, action, disabled);
+        }
+
+        for boundary in [(6,7), (8,9)] {
+            let (Some(a), Some(b)) = (toolbar::slot_rect(bar, boundary.0),
+                toolbar::slot_rect(bar, boundary.1)) else { continue; };
+            if a.right == b.left { continue; }
+            let x = (a.right + b.left) / 2 - origin.x;
+            let brush = CreateSolidBrush(0x00E5E5E5);
+            if brush != 0 {
+                let rect = WinRect { left: x, right: x + 1,
+                    top: local.top + 13, bottom: local.bottom - 13 };
+                FillRect(dc, &rect, brush);
+                DeleteObject(brush);
+            }
+        }
+
+        // Render the hover hint outside the bar, never over the button row.
+        if let Some(slot) = hover {
+            if let Some(cell) = toolbar::slot_rect(bar, slot) {
+                let label = toolbar::TITLES[slot];
+                let width = (label.chars().count() as i32 * 9 + 16).clamp(56, 165);
+                let tip_left = (cell.left + cell.width()/2 - width/2)
+                    .clamp(desktop.left, desktop.right.saturating_sub(width));
+                let y = if bar.top.saturating_sub(29) >= desktop.top {
+                    bar.top - 29
+                } else {
+                    bar.bottom.saturating_add(5).min(desktop.bottom.saturating_sub(24))
+                };
+                let tip = Rect { left: tip_left - origin.x, top: y - origin.y,
+                    right: tip_left + width - origin.x, bottom: y + 24 - origin.y };
+                toolbar_rounded(dc, tip, 7, 0x00444444, 0x00444444);
+                let glyphs = utf16(label);
+                let face = utf16("Microsoft YaHei UI");
+                let font = CreateFontW(16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, face.as_ptr());
+                let old = if font != 0 { SelectObject(dc, font) } else { 0 };
+                SetTextColor(dc, 0x00FFFFFF);
+                SetBkMode(dc, TRANSPARENT);
+                TextOutW(dc, tip.left + 8, tip.top + 3, glyphs.as_ptr(),
+                    glyphs.len() as i32 - 1);
+                if font != 0 { SelectObject(dc, old); DeleteObject(font); }
+            }
+        }
+        RestoreDC(dc, saved);
+    }
+}
+
 fn paint_overlay(hwnd: Hwnd) {
     // SAFETY: BeginPaint/EndPaint are paired; HDC is only used inside the paint call.
     unsafe {
