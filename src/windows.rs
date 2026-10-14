@@ -34,6 +34,7 @@ const SW_SHOW: i32 = 5;
 const SW_HIDE: i32 = 0;
 const WM_DESTROY: u32 = 0x0002;
 const WM_PAINT: u32 = 0x000F;
+const WM_ERASEBKGND: u32 = 0x0014;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_DPICHANGED: u32 = 0x02E0;
@@ -594,17 +595,79 @@ fn draw_dimming_layer(target: Hdc, width: i32, height: i32) {
     }
 }
 
+
+// The overlay is always composited away from the screen, then presented as one
+// BitBlt. Painting several GDI layers directly to the window caused visible
+// black/white flashes while moving or resizing the selection.
+struct PaintSurface {
+    dc: Hdc,
+    bitmap: Hobj,
+    previous: Hobj,
+    width: i32,
+    height: i32,
+}
+
+impl PaintSurface {
+    fn new(screen: Hdc, width: i32, height: i32) -> Option<Self> {
+        if screen == 0 || width <= 0 || height <= 0 { return None; }
+        // SAFETY: compatible DC and selected bitmap are owned by this object.
+        unsafe {
+            let dc = CreateCompatibleDC(screen);
+            if dc == 0 { return None; }
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            if bitmap == 0 {
+                DeleteDC(dc);
+                return None;
+            }
+            let previous = SelectObject(dc, bitmap);
+            if previous == 0 || previous == -1 {
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                return None;
+            }
+            Some(Self { dc, bitmap, previous, width, height })
+        }
+    }
+}
+
+impl Drop for PaintSurface {
+    fn drop(&mut self) {
+        // SAFETY: restore the stock bitmap before deleting the allocated one.
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.dc);
+        }
+    }
+}
+
+thread_local! {
+    // Owned only while the screenshot overlay is active. It is released on
+    // cancel, export, DPI change, or overlay destruction.
+    static PAINT_SURFACE: RefCell<Option<PaintSurface>> = const { RefCell::new(None) };
+}
+
 fn paint_overlay(hwnd: Hwnd) {
     // SAFETY: BeginPaint/EndPaint are paired; HDC is only used inside the paint call.
     unsafe {
         let mut ps: PaintStruct = zeroed();
-        let dc = BeginPaint(hwnd, &mut ps);
-        if dc == 0 { return; }
+        let screen_dc = BeginPaint(hwnd, &mut ps);
+        if screen_dc == 0 { return; }
         APP.with(|cell| {
             let state = cell.borrow();
             let Some(frame) = &state.frame else { return; };
-            let info = bitmap_info(frame.bounds.width(), frame.bounds.height());
-            StretchDIBits(dc, 0, 0, frame.bounds.width(), frame.bounds.height(), 0, 0,
+            PAINT_SURFACE.with(|cell| {
+                let mut surface = cell.borrow_mut();
+                let width = frame.bounds.width();
+                let height = frame.bounds.height();
+                if surface.as_ref().is_none_or(|p| p.width != width || p.height != height) {
+                    *surface = PaintSurface::new(screen_dc, width, height);
+                }
+                // In allocation failure, paint directly so the app remains
+                // functional; normal operation always uses the backbuffer.
+                let dc = surface.as_ref().map_or(screen_dc, |p| p.dc);
+                let info = bitmap_info(width, height);
+                StretchDIBits(dc, 0, 0, frame.bounds.width(), frame.bounds.height(), 0, 0,
                 frame.bounds.width(), frame.bounds.height(), frame.pixels.as_ptr() as *const c_void,
                 &info, DIB_RGB_COLORS, SRCCOPY);
             draw_dimming_layer(dc, frame.bounds.width(), frame.bounds.height());
@@ -678,7 +741,18 @@ fn paint_overlay(hwnd: Hwnd) {
                         TextOutW(dc, left + 5, bar.top + 9, glyphs.as_ptr(), glyphs.len() as i32 - 1);
                     }
                 }
-            }
+                if surface.is_some() {
+                    // BeginPaint clips the destination to rc_paint. Present
+                    // only invalidated pixels after ALL rendering is complete.
+                    let update = ps.rc_paint;
+                    let w = update.right.saturating_sub(update.left);
+                    let h = update.bottom.saturating_sub(update.top);
+                    if w > 0 && h > 0 {
+                        BitBlt(screen_dc, update.left, update.top, w, h, dc,
+                            update.left, update.top, SRCCOPY);
+                    }
+                }
+            });
         });
         EndPaint(hwnd, &ps);
     }
@@ -724,6 +798,8 @@ fn start_capture() {
 
 fn close_overlay() {
     cancel_text_edit();
+    // Release the selected bitmap/DC before freeing the captured frame.
+    PAINT_SURFACE.with(|cell| { *cell.borrow_mut() = None; });
     let hwnd = APP.with(|cell| {
         let mut s = cell.borrow_mut();
         s.frame = None;
@@ -1108,6 +1184,7 @@ fn mouse_up(hwnd: Hwnd, l: Lparam) {
 
 unsafe extern "system" fn overlay_proc(hwnd: Hwnd, message: u32, w: Wparam, l: Lparam) -> Lresult {
     match message {
+        WM_ERASEBKGND => 1, // compositor owns every pixel; never erase to white/black
         WM_PAINT => { paint_overlay(hwnd); 0 }
         WM_MOUSEMOVE => { mouse_move(hwnd, l); 0 }
         WM_LBUTTONDOWN => { mouse_down(hwnd, l); 0 }
