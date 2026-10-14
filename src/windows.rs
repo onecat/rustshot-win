@@ -281,7 +281,6 @@ extern "system" {
 extern "system" { fn CoTaskMemFree(ptr: *mut c_void); }
 
 fn utf16(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
-fn win_rect(r: Rect) -> WinRect { WinRect { left: r.left, top: r.top, right: r.right, bottom: r.bottom } }
 fn low_word_signed(l: Lparam) -> i32 { l as u16 as i16 as i32 }
 fn high_word_signed(l: Lparam) -> i32 { (l >> 16) as u16 as i16 as i32 }
 fn bitmap_info(w: i32, h: i32) -> BitmapInfo {
@@ -742,11 +741,11 @@ unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, action: usize, disabled: bool
         8 | 9 => { // mirrored undo / redo circular arrow
             let direction = if action == 8 { 1 } else { -1 };
             toolbar_line(dc, cx - 7 * direction, cy + 4, cx - 7 * direction, cy - 2);
-            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - 1 * direction, cy - 7);
-            toolbar_line(dc, cx - 1 * direction, cy - 7, cx + 6 * direction, cy - 5);
+            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - direction, cy - 7);
+            toolbar_line(dc, cx - direction, cy - 7, cx + 6 * direction, cy - 5);
             toolbar_line(dc, cx + 6 * direction, cy - 5, cx + 8 * direction, cy);
             toolbar_line(dc, cx + 8 * direction, cy, cx + 4 * direction, cy + 6);
-            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - 1 * direction, cy - 1);
+            toolbar_line(dc, cx - 7 * direction, cy - 2, cx - direction, cy - 1);
             toolbar_line(dc, cx - 7 * direction, cy - 2, cx - 6 * direction, cy - 8);
         }
         10 => { // confirm green check
