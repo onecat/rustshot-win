@@ -27,6 +27,7 @@ const SRCCOPY: u32 = 0x00CC0020;
 const CAPTUREBLT: u32 = 0x40000000;
 const DIB_RGB_COLORS: u32 = 0;
 const BI_RGB: u32 = 0;
+const GM_ADVANCED: i32 = 2;
 const BLACKNESS: u32 = 0x00000042;
 const WS_POPUP: u32 = 0x80000000;
 const WS_CLIPCHILDREN: u32 = 0x02000000;
@@ -125,6 +126,17 @@ struct BlendFunction {
     blend_flags: u8,
     constant_alpha: u8,
     alpha_format: u8,
+}
+// GDI XFORM uses f32 and is layout-compatible with Win32's XFORM.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Xform {
+    m11: f32,
+    m12: f32,
+    m21: f32,
+    m22: f32,
+    dx: f32,
+    dy: f32,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -225,6 +237,8 @@ extern "system" {
     fn MoveToEx(dc: Hdc, x: i32, y: i32, previous: *mut WinPoint) -> i32;
     fn LineTo(dc: Hdc, x: i32, y: i32) -> i32;
     fn SaveDC(dc: Hdc) -> i32;
+    fn SetGraphicsMode(dc: Hdc, mode: i32) -> i32;
+    fn SetWorldTransform(dc: Hdc, transform: *const Xform) -> i32;
     fn RestoreDC(dc: Hdc, saved: i32) -> i32;
     fn IntersectClipRect(dc: Hdc, left: i32, top: i32, right: i32, bottom: i32) -> i32;
     fn CreateSolidBrush(color: u32) -> Hobj;
@@ -687,9 +701,26 @@ unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, item: toolbar::Item) {
             _ => 0x00353535,
         }
     };
+    // Slightly enlarge every vector glyph (including text and pen strokes),
+    // centered inside its resized hit target. Win32 advanced GDI mode scales
+    // existing drawing commands without changing the screenshot image itself.
+    let saved = SaveDC(dc);
+    if saved != 0 && SetGraphicsMode(dc, GM_ADVANCED) != 0 {
+        let scale = if bounds.height() >= 44 { 1.17_f32 } else { 1.20_f32 };
+        let transform = Xform {
+            m11: scale, m12: 0.0, m21: 0.0, m22: scale,
+            dx: (1.0-scale) * cx as f32,
+            dy: (1.0-scale) * cy as f32,
+        };
+        // Failure falls back to unscaled painting, never an incomplete icon.
+        SetWorldTransform(dc, &transform);
+    }
     let size = if bounds.height() >= 44 { 10 } else { 8 };
     let pen = CreatePen(PS_SOLID, if bounds.height() >= 44 { 2 } else { 1 }, color);
-    if pen == 0 { return; }
+    if pen == 0 {
+        if saved != 0 { RestoreDC(dc, saved); }
+        return;
+    }
     let old_pen = SelectObject(dc, pen);
     let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
     match item.glyph {
@@ -842,6 +873,7 @@ unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, item: toolbar::Item) {
     SelectObject(dc,old_brush);
     SelectObject(dc,old_pen);
     DeleteObject(pen);
+    if saved != 0 { RestoreDC(dc, saved); }
 }
 
 fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
@@ -852,7 +884,7 @@ fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
     unsafe {
         let saved = SaveDC(dc);
         if saved == 0 { return; }
-        let radius = if toolbar::is_compact(desktop) { 9 } else { 12 };
+        let radius = if toolbar::is_compact(desktop) { 10 } else { 14 };
         // Soft one-pixel outline and low elevation, matching supplied images.
         toolbar_rounded(dc, Rect {
             left: local.left + 1, top: local.top + 3,
@@ -900,25 +932,28 @@ fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
         if let Some(index) = hover {
             if let Some(cell) = toolbar::slot_rect(bar, index) {
                 let label = all[index].label;
-                let characters = label.chars().count() as i32;
-                let width = (characters * 8 + 18).clamp(54, 210).min(desktop.width());
+                // Chinese glyphs are much wider than ASCII at -16 character
+                // height; avoid clipping longer disabled-action tooltips.
+                let text_width: i32 = label.chars()
+                    .map(|ch| if ch.is_ascii() { 9 } else { 17 }).sum();
+                let width = (text_width + 20).clamp(62, 260).min(desktop.width());
                 let left = (cell.left + cell.width()/2 - width/2)
                     .clamp(desktop.left, desktop.right.saturating_sub(width));
-                let y = if bar.bottom.saturating_add(28) <= desktop.bottom {
+                let y = if bar.bottom.saturating_add(33) <= desktop.bottom {
                     bar.bottom + 4
                 } else {
-                    bar.top.saturating_sub(27).max(desktop.top)
+                    bar.top.saturating_sub(31).max(desktop.top)
                 };
                 let tip = Rect { left: left-origin.x, top: y-origin.y,
-                    right: left+width-origin.x, bottom: y+23-origin.y };
+                    right: left+width-origin.x, bottom: y+27-origin.y };
                 toolbar_rounded(dc, tip, 5, 0x00484848, 0x00484848);
                 let glyphs = utf16(label);
                 let face = utf16("Microsoft YaHei UI");
-                let font = CreateFontW(14,0,0,0,400,0,0,0,1,0,0,4,0,face.as_ptr());
+                let font = CreateFontW(-16,0,0,0,400,0,0,0,1,0,0,4,0,face.as_ptr());
                 let old = if font != 0 { SelectObject(dc, font) } else { 0 };
                 SetTextColor(dc,0x00FFFFFF);
                 SetBkMode(dc,TRANSPARENT);
-                TextOutW(dc,tip.left + 7,tip.top + 3,glyphs.as_ptr(),glyphs.len() as i32-1);
+                TextOutW(dc,tip.left + 8,tip.top + 4,glyphs.as_ptr(),glyphs.len() as i32-1);
                 if font != 0 {SelectObject(dc,old);DeleteObject(font);}
             }
         }
@@ -972,15 +1007,15 @@ fn paint_overlay(hwnd: Hwnd) {
                     SelectObject(dc, old_pen);
                     DeleteObject(pen);
                 }
-                // Screenshot reference: small 1693 x 1185 at the upper-left.
+                // Enlarge the top-left screenshot dimensions from v0.6, keeping the same anchor.
                 SetBkMode(dc, TRANSPARENT);
                 SetTextColor(dc, 0x00FFFFFF);
                 let caption = format!("{} x {}", selection.width(), selection.height());
                 let label = utf16(&caption);
                 let face = utf16("Segoe UI");
-                let font = CreateFontW(14,0,0,0,400,0,0,0,1,0,0,4,0,face.as_ptr());
+                let font = CreateFontW(-18,0,0,0,500,0,0,0,1,0,0,4,0,face.as_ptr());
                 let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
-                TextOutW(dc, rel.left + 1, rel.top.saturating_sub(19).max(0),
+                TextOutW(dc, rel.left + 1, rel.top.saturating_sub(25).max(0),
                     label.as_ptr(), label.len() as i32 - 1);
                 if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
                 if state.selected.is_some() {
@@ -1023,7 +1058,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.6.0");
+    let title = utf16("RustShot v0.6.1");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }

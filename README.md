@@ -2,9 +2,9 @@
 
 Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workflow inspired by desktop WeChat screenshot selection. No Electron, WebView, cloud upload, telemetry, or administrator access is required.
 
-> **Current status: v0.6.0 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
+> **Current status: v0.6.1 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
 
-## Implemented through v0.6.0
+## Implemented through v0.6.1
 
 - Single-instance notification area app, `Alt+A` global shortcut (falls back to `Ctrl+Shift+A` if occupied).
 - Take a frozen desktop snapshot **before** displaying the darkened overlay; v0.4 uses a single full-desktop BGRA buffer plus an `AlphaBlend` 1×1 black source instead of keeping a second full-sized darkened BGRA image.
@@ -26,7 +26,7 @@ Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workfl
 
 ### Keyboard / mouse quick start
 
-1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.6.0-win-x64-portable` ZIP (or build it yourself) and start it.
+1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.6.1-win-x64-portable` ZIP (or build it yourself) and start it.
 2. Press `Alt+A` (or fallback `Ctrl+Shift+A`).
 3. Drag a screenshot rectangle or click a highlighted window.
 4. Drag the green handles to resize; drag inside the selected area to move.
@@ -51,6 +51,17 @@ GitHub Actions builds with a `windows-2022` runner. A green CI run proves build,
 
 
 
+
+### v0.6.1 readability and toolbar sizing hotfix
+
+Based on the user's real Windows 11 RustShot v0.6 screenshot: the crop dimension text and all toolbar glyphs rendered noticeably too small compared to the reference WeChat tool.
+
+- Full toolbar from **824 × 52** to **900 × 60** physical pixels; compact profile from **556 × 41** to **608 × 47**, with icon centers and mouse-hit rectangles scaled from the same reference coordinates.
+- Top-left `width x height` caption increases from a **14px positive GDI cell-height** font to **18px negative character-height** with slightly heavier weight; caption baseline offset adjusts from 19 to 25px for readability.
+- All vector icon strokes scale around their existing centers using Win32 advanced graphics mode (approximately 17–20%); the containing click targets also grow.
+- Hover hints increase from a positive 14px font to a 16px character-height font, with taller hint background and adjusted placement.
+- No changes to mouse selection, annotation export, clipboard, screen capture, or the v0.4.1 no-flicker double-buffered overlay.
+- **Manual Windows 11 comparison required:** this is a code-level sizing adjustment, not a completed pixel-for-pixel validation of the user's machine.
 
 ### v0.6.0 user-reference UI reconstruction
 

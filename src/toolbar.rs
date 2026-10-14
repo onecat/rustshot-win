@@ -3,10 +3,16 @@
 //! disabled buttons and clicks cannot drift. All units are physical pixels.
 use crate::geometry::{Point, Rect};
 
-pub const FULL_WIDTH: i32 = 824;
-pub const FULL_HEIGHT: i32 = 52;
-pub const COMPACT_WIDTH: i32 = 556;
-pub const COMPACT_HEIGHT: i32 = 41;
+// Gently enlarge v0.6 bars while keeping the measured icon-center ratios.
+pub const FULL_WIDTH: i32 = 900;
+pub const FULL_HEIGHT: i32 = 60;
+pub const COMPACT_WIDTH: i32 = 608;
+pub const COMPACT_HEIGHT: i32 = 47;
+
+// Center coordinates below were measured at these original reference widths.
+// Slot bounds are scaled to the current bar, so paint and hit tests agree.
+const FULL_REFERENCE_WIDTH: i32 = 824;
+const COMPACT_REFERENCE_WIDTH: i32 = 556;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Glyph {
@@ -46,8 +52,8 @@ const COMPACT: [Item; 12] = [
     FULL[10], FULL[13], FULL[11], FULL[14], FULL[15],
 ];
 
-// Measured icon centers from the corresponding user references (within
-// the 824x52 and 556x41 bars). Keep fixed gaps and divider positions.
+// Measured icon centers from the user's 824px and 556px reference bars.
+// Scale positions uniformly, preserving group gaps and divider placement.
 const FULL_CENTERS: [i32; 16] =
     [38, 84, 130, 178, 225, 272, 320, 386, 437, 485, 550, 597, 645, 691, 737, 784];
 const COMPACT_CENTERS: [i32; 12] =
@@ -92,9 +98,9 @@ pub fn slot_rect(bar: Rect, slot: usize) -> Option<Rect> {
     if bar.is_empty() { return None; }
     let small = bar.height() <= COMPACT_HEIGHT;
     let (centers, standard_width, cell_width): (&[i32], i32, i32) = if small {
-        (&COMPACT_CENTERS, COMPACT_WIDTH, 36)
+        (&COMPACT_CENTERS, COMPACT_REFERENCE_WIDTH, 40)
     } else {
-        (&FULL_CENTERS, FULL_WIDTH, 42)
+        (&FULL_CENTERS, FULL_REFERENCE_WIDTH, 46)
     };
     let center = *centers.get(slot)?;
     // Scale only for unusually narrow desktops, keeping exact pixels for
@@ -133,7 +139,7 @@ mod tests {
         let bounds = desktop(1920);
         let sel = Rect { left: 100, top: 40, right: 1000, bottom: 500 };
         let bar = rect_for(sel, bounds);
-        assert_eq!((bar.width(), bar.height(), bar.top), (824, 52, 514));
+        assert_eq!((bar.width(), bar.height(), bar.top), (900, 60, 514));
         assert_eq!(items(bar).len(), 16);
         for (i, item) in items(bar).iter().enumerate() {
             let cell = slot_rect(bar, i).unwrap();
@@ -151,8 +157,8 @@ mod tests {
         let bounds = desktop(638);
         let sel = Rect { left: 20, top: 30, right: 505, bottom: 334 };
         let bar = rect_for(sel, bounds);
-        assert_eq!(bar.width(), 556);
-        assert_eq!(bar.height(), 41);
+        assert_eq!(bar.width(), 608);
+        assert_eq!(bar.height(), 47);
         assert_eq!(bar.top, 337);
         assert_eq!(items(bar).len(), 12);
         for (i, item) in items(bar).iter().enumerate() {
@@ -196,4 +202,21 @@ mod tests {
             assert!(item.left >= bounds.left && item.right <= bounds.right);
         }
     }
+    #[test]
+    fn enlarged_toolbar_retains_hit_targets_on_screen_edges() {
+        let bounds = desktop(1920);
+        let selection = Rect { left: 1150, top: 100, right: 1800, bottom: 980 };
+        let bar = rect_for(selection, bounds);
+        assert_eq!((bar.width(), bar.height()), (900, 60));
+        assert!(bar.left >= bounds.left && bar.right <= bounds.right);
+        assert!(bar.top < selection.top || bar.bottom <= bounds.bottom);
+        for (index, item) in items(bar).iter().enumerate() {
+            let hit = slot_rect(bar, index).unwrap();
+            assert!(hit.width() >= 45, "icon hit target should grow with the bar");
+            assert!(hit.left >= bar.left && hit.right <= bar.right);
+            let center = Point { x: (hit.left + hit.right) / 2, y: (hit.top + hit.bottom) / 2 };
+            assert_eq!(action_at(bar, center), item.action);
+        }
+    }
+
 }
