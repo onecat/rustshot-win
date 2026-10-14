@@ -4,6 +4,7 @@ use crate::annotations::{self, Annotation, History, Tool};
 use std::os::windows::ffi::OsStrExt;
 use crate::geometry::{Point, Rect};
 use crate::selection::Handle as ResizeHandle;
+use crate::toolbar;
 use crate::png;
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -218,6 +219,7 @@ extern "system" {
     fn CreatePen(style: i32, width: i32, color: u32) -> Hobj;
     fn GetStockObject(index: i32) -> Hobj;
     fn Rectangle(dc: Hdc, l: i32, t: i32, r: i32, b: i32) -> i32;
+    fn RoundRect(dc: Hdc, l: i32, t: i32, r: i32, b: i32, ellipse_w: i32, ellipse_h: i32) -> i32;
     fn Ellipse(dc: Hdc, l: i32, t: i32, r: i32, b: i32) -> i32;
     fn MoveToEx(dc: Hdc, x: i32, y: i32, previous: *mut WinPoint) -> i32;
     fn LineTo(dc: Hdc, x: i32, y: i32) -> i32;
@@ -305,6 +307,7 @@ struct AppState {
     text_anchor: Point,
     ime_composing: bool,
     tool: Tool,
+    toolbar_hover: Option<usize>,
     history: History,
     drag_anchor: Point,
     drag_initial: Rect,
@@ -317,7 +320,7 @@ impl AppState {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
             dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
             ime_composing: false,
-            tool: Tool::Select, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
+            tool: Tool::Select, toolbar_hover: None, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
     }
 }
 thread_local! { static APP: RefCell<AppState> = RefCell::new(AppState::new()); }
@@ -404,17 +407,7 @@ fn local_pos(frame: &Frame, l: Lparam) -> Point {
     }
 }
 fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
-    let width = 630.min(bounds.width().max(1));
-    let height = 34.min(bounds.height().max(1));
-    let x = selection.right.saturating_sub(width)
-        .clamp(bounds.left, bounds.right.saturating_sub(width));
-    let proposed = selection.bottom.saturating_add(7);
-    let y = if proposed.saturating_add(height) <= bounds.bottom {
-        proposed
-    } else {
-        selection.top.saturating_sub(7).saturating_sub(height).max(bounds.top)
-    };
-    Rect { left: x, top: y, right: x + width, bottom: y + height }
+    toolbar::rect_for(selection, bounds)
 }
 
 // Preview uses GDI for low allocation while editing. Export uses the same vector
@@ -711,36 +704,9 @@ fn paint_overlay(hwnd: Hwnd) {
                     if white != 0 { DeleteObject(white); }
                     if green != 0 { DeleteObject(green); }
 
-                    let bar = toolbar_for(selection, frame.bounds).translated(-frame.bounds.left, -frame.bounds.top);
-                    let background = CreateSolidBrush(0x00FAFAFA);
-                    if background != 0 {
-                        FillRect(dc, &win_rect(bar), background);
-                        DeleteObject(background);
-                    }
-                    let labels = [
-                        Tool::LABELS[0], Tool::LABELS[1], Tool::LABELS[2],
-                        Tool::LABELS[3], Tool::LABELS[4], Tool::LABELS[5],
-                        Tool::LABELS[6], "撤销", "重做", "完成", "取消",
-                    ];
-                    SetBkMode(dc, TRANSPARENT);
-                    for (index, label) in labels.iter().enumerate() {
-                        let left = bar.left + index as i32 * bar.width() / 11;
-                        let right = bar.left + (index as i32 + 1) * bar.width() / 11;
-                        if index < 7 && state.tool == [
-                            Tool::Select, Tool::Rectangle, Tool::Ellipse, Tool::Arrow,
-                            Tool::Pen, Tool::Text, Tool::Mosaic
-                        ][index] {
-                            let brush = CreateSolidBrush(0x00D5F4E4);
-                            if brush != 0 {
-                                FillRect(dc, &WinRect { left, top: bar.top, right,
-                                    bottom: bar.bottom }, brush);
-                                DeleteObject(brush);
-                            }
-                        }
-                        SetTextColor(dc, if index == 9 { 0x002A9B21 } else { 0x00555555 });
-                        let glyphs = utf16(label);
-                        TextOutW(dc, left + 5, bar.top + 9, glyphs.as_ptr(), glyphs.len() as i32 - 1);
-                    }
+                    draw_toolbar(dc, selection, frame.bounds, state.tool,
+                        state.toolbar_hover, !state.history.committed.is_empty(),
+                        !state.history.undone.is_empty());
                 }
             }
             if surface.is_some() {
@@ -814,6 +780,7 @@ fn close_overlay() {
         s.text_edit = 0;
         s.ime_composing = false;
         s.tool = Tool::Select;
+        s.toolbar_hover = None;
         s.history.clear();
         let previous = std::mem::replace(&mut s.restore_focus, 0);
         (std::mem::replace(&mut s.overlay, 0), previous)
@@ -1076,8 +1043,8 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         if let Some(selection) = state.selected {
             let bar = toolbar_for(selection, bounds);
             if bar.contains(point) {
-                return ((i64::from(point.x - bar.left) * 11 / i64::from(bar.width())) as usize)
-                    .min(10) + 1;
+                // The gaps between WeChat-style button groups are inert.
+                return toolbar::action_at(bar, point).unwrap_or(21);
             }
         }
 
@@ -1144,7 +1111,7 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
         let Some(frame) = &s.frame else { return false; };
         let point = local_pos(frame, l);
         let bounds = frame.bounds;
-        let before = (s.selected, s.hover,
+        let before = (s.selected, s.hover, s.toolbar_hover,
             s.active_annotation.as_ref().and_then(|a| a.points.last().copied()));
         if s.dragging {
             if let Some(annotation) = &mut s.active_annotation {
@@ -1161,7 +1128,12 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
         } else if s.selected.is_none() {
             s.hover = hit_test(frame, point);
         }
-        let after = (s.selected, s.hover,
+        s.toolbar_hover = if let Some(selection) = s.selected {
+            if !s.dragging {
+                toolbar::slot_at(toolbar_for(selection, bounds), point)
+            } else { None }
+        } else { None };
+        let after = (s.selected, s.hover, s.toolbar_hover,
             s.active_annotation.as_ref().and_then(|a| a.points.last().copied()));
         before != after
     });
