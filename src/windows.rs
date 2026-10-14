@@ -742,7 +742,8 @@ fn paint_overlay(hwnd: Hwnd) {
                         TextOutW(dc, left + 5, bar.top + 9, glyphs.as_ptr(), glyphs.len() as i32 - 1);
                     }
                 }
-                if surface.is_some() {
+            }
+            if surface.is_some() {
                     // BeginPaint clips the destination to rc_paint. Present
                     // only invalidated pixels after ALL rendering is complete.
                     let update = ps.rc_paint;
@@ -761,7 +762,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.4.0");
+    let title = utf16("RustShot v0.4.1");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }
