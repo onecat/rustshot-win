@@ -2,9 +2,9 @@
 
 Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workflow inspired by desktop WeChat screenshot selection. No Electron, WebView, cloud upload, telemetry, or administrator access is required.
 
-> **Current status: v0.4.0 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
+> **Current status: v0.4.1 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
 
-## Implemented in v0.4.0
+## Implemented through v0.4.1
 
 - Single-instance notification area app, `Alt+A` global shortcut (falls back to `Ctrl+Shift+A` if occupied).
 - Take a frozen desktop snapshot **before** displaying the darkened overlay; v0.4 uses a single full-desktop BGRA buffer plus an `AlphaBlend` 1×1 black source instead of keeping a second full-sized darkened BGRA image.
@@ -25,7 +25,7 @@ Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workfl
 
 ### Keyboard / mouse quick start
 
-1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.4.0-win-x64-portable` ZIP (or build it yourself) and start it.
+1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.4.1-win-x64-portable` ZIP (or build it yourself) and start it.
 2. Press `Alt+A` (or fallback `Ctrl+Shift+A`).
 3. Drag a screenshot rectangle or click a highlighted window.
 4. Drag the green handles to resize; drag inside the selected area to move.
@@ -47,6 +47,15 @@ cargo build --release --target x86_64-pc-windows-msvc
 ```
 
 GitHub Actions builds with a `windows-2022` runner. A green CI run proves build, lint, and unit-test status; GitHub hosted runners cannot verify that global hotkeys, window enumeration, tray state, or screenshot rendering work on your Windows 11 desktop.
+
+
+### v0.4.1 flicker hotfix
+
+- Fix black/white flashing when dragging or moving a screenshot selection: all GDI layers are drawn in a reusable off-screen compatible bitmap, then presented with one `BitBlt` on each `WM_PAINT` instead of painting separate intermediate layers directly to the screen.
+- Handle `WM_ERASEBKGND` without erasing and add `WS_CLIPCHILDREN` to avoid interfering with the native text-entry control.
+- Only invalidate the overlay when a mouse move changes the selection, hovered window, or active annotation; no redraw for identical visual state.
+- The backbuffer is allocated once per overlay and explicitly freed on capture or cancel. At 3840×2160×32bpp it uses roughly 31.6 MiB extra GDI bitmap memory **while screenshot mode is active**; it is **not** resident while idle in the tray.
+- Windows 11 real-device QA is required: CI cannot simulate display composition, flicker, remote desktop, mixed DPI, or Intel/NVIDIA/AMD driver variants.
 
 ## Not finished / known limitations
 
