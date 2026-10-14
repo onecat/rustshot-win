@@ -85,11 +85,11 @@ mod tests {
         let bar = rect_for(Rect { left: -500, top: 20, right: 700, bottom: 350 }, bounds());
         assert_eq!(bar.width(), TOOLBAR_WIDTH);
         assert_eq!(bar.height(), TOOLBAR_HEIGHT);
-        for i in 0..BUTTON_COUNT {
+        for (i, action) in ACTIONS.iter().enumerate() {
             let cell = slot_rect(bar, i).unwrap();
             let mid = Point { x: (cell.left + cell.right) / 2, y: (cell.top + cell.bottom) / 2 };
             assert_eq!(slot_at(bar, mid), Some(i));
-            assert_eq!(action_at(bar, mid), Some(ACTIONS[i]));
+            assert_eq!(action_at(bar, mid), Some(*action));
         }
         assert_eq!(ACTIONS[9], 11); // red X cancels
         assert_eq!(ACTIONS[10], 10); // green check finishes
