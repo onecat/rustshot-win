@@ -55,6 +55,12 @@ impl Annotation {
         self.stroke = stroke;
         self
     }
+    /// Drawing previews need a single anchor for text but two for shapes.
+    /// Keep this decision unit-tested and shared with the Win32 renderer.
+    pub fn has_preview_geometry(&self) -> bool {
+        if self.tool == Tool::Text { !self.points.is_empty() }
+        else { self.points.len() >= 2 }
+    }
     /// Translate every stored point when the entire screenshot selection moves.
     /// Keep the text anchor, pen polyline, and mosaic rectangle together.
     pub fn translate(&mut self, dx: i32, dy: i32) {
@@ -382,6 +388,16 @@ mod tests {
         let mut a=Annotation::text_at(Point{x:i32::MAX-1,y:i32::MIN+1},"A".into());
         a.translate(100,-100);
         assert_eq!(a.points[0],Point{x:i32::MAX,y:i32::MIN});
+    }
+
+    #[test]
+    fn text_preview_accepts_single_anchor_but_shapes_need_two_points() {
+        let text = Annotation::text_at(Point {x:-1,y:7},"中文".into());
+        assert!(text.has_preview_geometry());
+        assert!(text.meaningful());
+        let mut rectangle=Annotation::begin(Tool::Rectangle,Point {x:0,y:0});
+        rectangle.points.pop();
+        assert!(!rectangle.has_preview_geometry());
     }
 
 }
