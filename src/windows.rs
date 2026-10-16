@@ -42,6 +42,7 @@ const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_DPICHANGED: u32 = 0x02E0;
 const WM_KEYDOWN: u32 = 0x0100;
+const WM_SETFONT: u32 = 0x0030;
 const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
 const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
 const WS_CHILD: u32 = 0x40000000;
@@ -177,6 +178,7 @@ extern "system" {
         x: i32, y: i32, w: i32, h: i32, parent: Hwnd, menu: Handle, inst: Handle, param: *const c_void) -> Hwnd;
     fn DefWindowProcW(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult;
     fn DestroyWindow(hwnd: Hwnd) -> i32;
+    fn SendMessageW(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult;
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
     fn UpdateWindow(hwnd: Hwnd) -> i32;
     fn SetForegroundWindow(hwnd: Hwnd) -> i32;
@@ -319,6 +321,7 @@ struct AppState {
     resizing: Option<ResizeHandle>,
     active_annotation: Option<Annotation>,
     text_edit: Hwnd,
+    text_font: Hobj,
     text_anchor: Point,
     ime_composing: bool,
     tool: Tool,
@@ -337,7 +340,7 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
-            dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
+            dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_font: 0, text_anchor: Point::default(),
             ime_composing: false,
             tool: Tool::Select, stroke: Stroke::default(), color_index:0, auto_save:true, auto_copy:true, toolbar_hover: None, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
     }
@@ -432,7 +435,9 @@ fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
 // Preview uses GDI for low allocation while editing. Export uses the same vector
 // records rendered into an independent BGRA crop in annotations::render.
 unsafe fn preview_annotation(dc: Hdc, a: &Annotation, origin: Point) {
-    if a.points.len() < 2 { return; }
+    // Text annotations have one anchor, while vector shapes need two points.
+    // The old blanket two-point check hid ALL committed text in the preview.
+    if a.points.is_empty() || (a.tool != Tool::Text && a.points.len() < 2) { return; }
     let first = a.points[0];
     let last = *a.points.last().unwrap_or(&first);
     let to_local = |p: Point| Point { x: p.x - origin.x, y: p.y - origin.y };
@@ -1379,17 +1384,22 @@ fn start_text_edit(overlay: Hwnd) {
             state.text_edit = edit;
             state.text_anchor = position;
             state.ime_composing = false;
+            state.text_font = create_annotation_font(state.stroke.width);
+            if state.text_font != 0 {
+                SendMessageW(edit, WM_SETFONT, state.text_font as Wparam, 1);
+            }
         });
         SetFocus(edit);
     }
 }
 
 fn commit_text_edit() {
-    let (edit, position, overlay) = APP.with(|cell| {
+    let (edit, position, overlay, font) = APP.with(|cell| {
         let mut state = cell.borrow_mut();
         let edit = std::mem::replace(&mut state.text_edit, 0);
+        let font = std::mem::replace(&mut state.text_font, 0);
         state.ime_composing = false;
-        (edit, state.text_anchor, state.overlay)
+        (edit, state.text_anchor, state.overlay, font)
     });
     if edit == 0 { return; }
     let words = unsafe {
@@ -1398,6 +1408,7 @@ fn commit_text_edit() {
         let mut buffer = vec![0u16; count + 1];
         let read = GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
         DestroyWindow(edit);
+        if font != 0 { DeleteObject(font); }
         String::from_utf16_lossy(&buffer[..read.max(0) as usize])
     };
     if !words.trim().is_empty() {
@@ -1413,14 +1424,14 @@ fn commit_text_edit() {
 }
 
 fn cancel_text_edit() {
-    let (edit, overlay) = APP.with(|cell| {
+    let (edit, font, overlay) = APP.with(|cell| {
         let mut state = cell.borrow_mut();
-        {
-            state.ime_composing = false;
-            (std::mem::replace(&mut state.text_edit, 0), state.overlay)
-        }
+        state.ime_composing = false;
+        (std::mem::replace(&mut state.text_edit, 0),
+         std::mem::replace(&mut state.text_font, 0), state.overlay)
     });
     if edit != 0 { unsafe { DestroyWindow(edit); } }
+    if font != 0 { unsafe { DeleteObject(font); } }
     if overlay != 0 {
         unsafe { SetFocus(overlay); InvalidateRect(overlay, null(), 0); }
     }
