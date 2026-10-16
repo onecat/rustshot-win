@@ -51,6 +51,7 @@ const ES_AUTOHSCROLL: u32 = 0x0080;
 const MF_CHECKED: u32 = 0x0008;
 const HKEY_CURRENT_USER: Handle = 0x80000001u32 as Handle;
 const REG_SZ: u32 = 1;
+const REG_DWORD: u32 = 4;
 const KEY_QUERY_VALUE: u32 = 0x0001;
 const KEY_SET_VALUE: u32 = 0x0002;
 const WM_HOTKEY: u32 = 0x0312;
@@ -323,6 +324,8 @@ struct AppState {
     tool: Tool,
     stroke: Stroke,
     color_index: usize,
+    auto_save: bool,
+    auto_copy: bool,
     toolbar_hover: Option<usize>,
     history: History,
     drag_anchor: Point,
@@ -336,7 +339,7 @@ impl AppState {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
             dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
             ime_composing: false,
-            tool: Tool::Select, stroke: Stroke::default(), color_index:0, toolbar_hover: None, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
+            tool: Tool::Select, stroke: Stroke::default(), color_index:0, auto_save:true, auto_copy:true, toolbar_hover: None, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
     }
 }
 thread_local! { static APP: RefCell<AppState> = RefCell::new(AppState::new()); }
@@ -1304,36 +1307,40 @@ fn save_png(width: u32, height: u32, pixels: &[u8]) -> io::Result<PathBuf> {
 fn finish_capture() {
     commit_text_edit();
     let picture = selected_image();
-    let owner = APP.with(|s| s.borrow().main);
+    let (owner,auto_copy,auto_save) = APP.with(|cell| {
+        let s=cell.borrow();
+        (s.main,s.auto_copy,s.auto_save)
+    });
     close_overlay();
-    let Some((w, h, pixels)) = picture else { return; };
-    let copied = put_clipboard(owner, w, h, &pixels);
-    // Reap completed workers and bound simultaneous full-resolution exports.
-    // When saving two screenshots is still in progress, wait for the oldest
-    // before starting another. This rare backpressure keeps memory bounded.
-    let oldest = APP.with(|cell| {
-        let mut app = cell.borrow_mut();
-        let mut i = 0;
-        while i < app.writers.len() {
-            if app.writers[i].is_finished() {
-                let completed = app.writers.remove(i);
-                let _ = completed.join();
-            } else { i += 1; }
-        }
-        if app.writers.len() >= MAX_CONCURRENT_SAVES {
-            Some(app.writers.remove(0))
-        } else { None }
-    });
-    if let Some(worker) = oldest { let _ = worker.join(); }
-    let worker = thread::spawn(move || {
-        if let Err(err) = save_png(w, h, &pixels) {
-            alert(0, &format!("Screenshot was not saved: {err}"));
-        }
-    });
-    APP.with(|cell| cell.borrow_mut().writers.push(worker));
-    if let Err(err) = copied { alert(owner, &format!("Clipboard copy failed; PNG save will still be attempted: {err}")); }
+    let Some((w,h,pixels))=picture else {return};
+    let copied = if auto_copy {Some(put_clipboard(owner,w,h,&pixels))} else {None};
+    if auto_save {
+        // Release finished writers; never queue more than two full BGRA crops.
+        let oldest=APP.with(|cell| {
+            let mut app=cell.borrow_mut();
+            let mut i=0;
+            while i<app.writers.len() {
+                if app.writers[i].is_finished() {
+                    let finished=app.writers.remove(i);
+                    let _=finished.join();
+                } else {i+=1;}
+            }
+            if app.writers.len()>=MAX_CONCURRENT_SAVES {
+                Some(app.writers.remove(0))
+            } else {None}
+        });
+        if let Some(worker)=oldest {let _=worker.join();}
+        let worker=thread::spawn(move || {
+            if let Err(err)=save_png(w,h,&pixels) {
+                alert(0,&format!("Screenshot PNG save failed: {err}"));
+            }
+        });
+        APP.with(|cell| cell.borrow_mut().writers.push(worker));
+    }
+    if let Some(Err(err))=copied {
+        alert(owner,&format!("Clipboard copy failed; automatic PNG saving setting is independent: {err}"));
+    }
 }
-
 
 fn start_text_edit(overlay: Hwnd) {
     cancel_text_edit();
@@ -1691,6 +1698,37 @@ fn set_startup(enabled: bool) -> Result<(), String> {
     else { Err(format!("Unable to change Windows startup registry value: {code}")) }
 }
 
+const SETTINGS_KEY: &str = "Software\\RustShot";
+fn open_settings_key() -> Result<Handle, String> {
+    let mut handle=0;
+    let key=utf16(SETTINGS_KEY);
+    let result=unsafe {RegCreateKeyExW(HKEY_CURRENT_USER,key.as_ptr(),0,null_mut(),
+        0,KEY_QUERY_VALUE|KEY_SET_VALUE,null(),&mut handle,null_mut())};
+    if result==0 {Ok(handle)} else {Err(format!("Settings registry access: {result}"))}
+}
+fn read_setting(name: &str, fallback: bool) -> bool {
+    let Ok(key)=open_settings_key() else {return fallback};
+    let value=utf16(name);
+    let mut raw=[0u8;4];
+    let mut len=4u32;
+    let mut kind=0u32;
+    let result=unsafe {RegQueryValueExW(key,value.as_ptr(),null_mut(),&mut kind,
+        raw.as_mut_ptr(),&mut len)};
+    unsafe {RegCloseKey(key);}
+    if result==0 && kind==REG_DWORD && len==4 {
+        u32::from_le_bytes(raw)!=0
+    } else {fallback}
+}
+fn set_setting(name: &str, enabled: bool) -> Result<(),String> {
+    let key=open_settings_key()?;
+    let value=utf16(name);
+    let raw=(enabled as u32).to_le_bytes();
+    let result=unsafe {RegSetValueExW(key,value.as_ptr(),0,REG_DWORD,
+        raw.as_ptr(),raw.len() as u32)};
+    unsafe {RegCloseKey(key);}
+    if result==0 {Ok(())} else {Err(format!("Cannot update {name}: {result}"))}
+}
+
 fn show_tray_menu(hwnd: Hwnd) {
     // SAFETY: Created menu is destroyed once; TrackPopupMenu returns the selected ID.
     unsafe {
@@ -1701,11 +1739,19 @@ fn show_tray_menu(hwnd: Hwnd) {
         let startup = startup_enabled().unwrap_or(false);
         let toggle = utf16(if startup { "开机启动：已开启 / Disable" }
                            else { "开机启动：已关闭 / Enable" });
+        let (auto_save,auto_copy)=APP.with(|cell| {
+            let state=cell.borrow();
+            (state.auto_save,state.auto_copy)
+        });
+        let save_text=utf16("截图自动保存 PNG / Auto save");
+        let copy_text=utf16("截图自动复制 / Auto copy");
         let quit = utf16("退出 / Exit");
         AppendMenuW(menu, MF_STRING, 1, take.as_ptr());
         AppendMenuW(menu, MF_STRING, 2, folder.as_ptr());
         AppendMenuW(menu, MF_STRING | if startup { MF_CHECKED } else { 0 },
             3, toggle.as_ptr());
+        AppendMenuW(menu,MF_STRING|if auto_save{MF_CHECKED}else{0},5,save_text.as_ptr());
+        AppendMenuW(menu,MF_STRING|if auto_copy{MF_CHECKED}else{0},6,copy_text.as_ptr());
         AppendMenuW(menu, MF_STRING, 4, quit.as_ptr());
         let mut point = WinPoint::default();
         GetCursorPos(&mut point);
@@ -1725,6 +1771,20 @@ fn show_tray_menu(hwnd: Hwnd) {
             3 => {
                 if let Err(err) = set_startup(!startup) {
                     alert(hwnd, &format!("Startup setting failed: {err}"));
+                }
+            },
+            5 | 6 => {
+                let (name,new_value)=if selection==5 {
+                    ("AutoSave",!auto_save)
+                } else {
+                    ("AutoCopy",!auto_copy)
+                };
+                match set_setting(name,new_value) {
+                    Ok(()) => APP.with(|cell| {
+                        let mut s=cell.borrow_mut();
+                        if selection==5 {s.auto_save=new_value;} else {s.auto_copy=new_value;}
+                    }),
+                    Err(err)=>alert(hwnd,&err),
                 }
             },
             4 => { DestroyWindow(hwnd); },
@@ -1775,7 +1835,12 @@ pub fn run() {
         let hwnd = CreateWindowExW(0, main_class.as_ptr(), main_class.as_ptr(), 0,
             0, 0, 0, 0, 0, 0, inst, null());
         if hwnd == 0 { alert(0, "Cannot initialize RustShot."); CloseHandle(mutex); return; }
-        APP.with(|s| s.borrow_mut().main = hwnd);
+        APP.with(|cell| {
+            let mut s=cell.borrow_mut();
+            s.main=hwnd;
+            s.auto_save=read_setting("AutoSave",true);
+            s.auto_copy=read_setting("AutoCopy",true);
+        });
         // Hotkey conflicts are not overridden: fall back to Ctrl+Shift+A.
         let fallback = if RegisterHotKey(hwnd, 1, MOD_ALT | MOD_NOREPEAT, b'A' as u32) == 0 {
             if RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, b'A' as u32) == 0 {
