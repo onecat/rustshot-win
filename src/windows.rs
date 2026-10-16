@@ -439,7 +439,7 @@ fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
 unsafe fn preview_annotation(dc: Hdc, a: &Annotation, origin: Point) {
     // Text annotations have one anchor, while vector shapes need two points.
     // The old blanket two-point check hid ALL committed text in the preview.
-    if a.points.is_empty() || (a.tool != Tool::Text && a.points.len() < 2) { return; }
+    if !a.has_preview_geometry() { return; }
     let first = a.points[0];
     let last = *a.points.last().unwrap_or(&first);
     let to_local = |p: Point| Point { x: p.x - origin.x, y: p.y - origin.y };
