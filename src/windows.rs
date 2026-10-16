@@ -1403,7 +1403,10 @@ fn commit_text_edit() {
         state.ime_composing = false;
         (edit, state.text_anchor, state.overlay, font)
     });
-    if edit == 0 { return; }
+    if edit == 0 {
+        if font != 0 { unsafe { DeleteObject(font); } }
+        return;
+    }
     let words = unsafe {
         // Limit input to 512 UTF-16 units, preventing pathological label sizes.
         let count = GetWindowTextLengthW(edit).clamp(0, 512) as usize;
@@ -1606,16 +1609,13 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
             } else if let Some(handle) = s.resizing {
                 s.selected = Some(handle.resize(s.drag_initial, point, bounds));
             } else if s.moving {
-                let moved = s.drag_initial.translated(
-                    point.x.saturating_sub(s.drag_anchor.x),
-                    point.y.saturating_sub(s.drag_anchor.y)
-                ).clamp_inside(bounds);
+                let moved = crate::selection::move_crop(
+                    s.drag_initial, s.drag_anchor, point, bounds);
                 if let Some(previous) = s.selected {
                     // Delta must use the CLAMPED crop, otherwise annotations
                     // drift at monitor boundaries and after repeated drags.
-                    s.history.translate(
-                        moved.left.saturating_sub(previous.left),
-                        moved.top.saturating_sub(previous.top));
+                    let (dx, dy) = crate::selection::crop_delta(previous, moved);
+                    s.history.translate(dx, dy);
                 }
                 s.selected = Some(moved);
             } else {
