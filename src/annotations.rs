@@ -55,6 +55,14 @@ impl Annotation {
         self.stroke = stroke;
         self
     }
+    /// Translate every stored point when the entire screenshot selection moves.
+    /// Keep the text anchor, pen polyline, and mosaic rectangle together.
+    pub fn translate(&mut self, dx: i32, dy: i32) {
+        for p in &mut self.points {
+            p.x = p.x.saturating_add(dx);
+            p.y = p.y.saturating_add(dy);
+        }
+    }
     pub fn update(&mut self, point: Point) {
         if self.tool == Tool::Pen {
             if self.points.last() != Some(&point) { self.points.push(point); }
@@ -103,6 +111,14 @@ impl History {
     pub fn clear(&mut self) {
         self.committed.clear();
         self.undone.clear();
+    }
+    /// Translate both visible annotations and redo history. The user may undo
+    /// before moving the selection and redo afterward without a coordinate jump.
+    pub fn translate(&mut self, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 { return; }
+        for item in self.committed.iter_mut().chain(self.undone.iter_mut()) {
+            item.translate(dx, dy);
+        }
     }
 }
 
@@ -339,6 +355,33 @@ mod tests {
     fn thickness_is_clamped() {
         assert_eq!(Stroke::preset(4, 0).width, 1);
         assert_eq!(Stroke::preset(3, u8::MAX).width, 9);
+    }
+
+    #[test]
+    fn move_crop_keeps_annotation_geometry_and_redo_coordinates() {
+        let mut history = History::default();
+        let mut pen = Annotation::begin(Tool::Pen, Point{x:-70,y:18})
+            .with_stroke(Stroke::preset(1,7));
+        pen.update(Point{x:-60,y:24});
+        pen.update(Point{x:-55,y:33});
+        history.push(pen);
+        history.push(Annotation::text_at(Point{x:7,y:12},"测试".into()));
+        assert!(history.undo());
+        history.translate(50,-20);
+        assert_eq!(history.committed[0].points[0],Point{x:-20,y:-2});
+        assert!(history.redo());
+        assert_eq!(history.committed[1].points[0],Point{x:57,y:-8});
+        assert_eq!(history.committed[0].stroke, Stroke::preset(1,7));
+        assert!(history.undo());
+        history.translate(-10,10);
+        assert!(history.redo());
+        assert_eq!(history.committed[1].points[0],Point{x:47,y:2});
+    }
+    #[test]
+    fn translation_saturates_near_virtual_coordinate_limits() {
+        let mut a=Annotation::text_at(Point{x:i32::MAX-1,y:i32::MIN+1},"A".into());
+        a.translate(100,-100);
+        assert_eq!(a.points[0],Point{x:i32::MAX,y:i32::MIN});
     }
 
 }
