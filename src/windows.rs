@@ -1126,7 +1126,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.7.0");
+    let title = utf16("RustShot v0.8.0");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }
@@ -1466,13 +1466,15 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
             if let Some(handle) = ResizeHandle::hit_test(selection, point) {
                 state.resizing = Some(handle);
                 state.drag_initial = selection;
-                state.history.clear();
+                // Resize only changes the crop boundary. Previous annotations
+                // remain in desktop coordinates and are clipped to the new crop.
                 state.tool = Tool::Select;
             } else if selection.contains(point) {
                 if state.tool == Tool::Select {
                     state.moving = true;
                     state.drag_initial = selection;
-                    state.history.clear();
+                    // The annotations move with the crop on mousemove, instead
+                    // of being discarded when the user repositions a capture.
                 } else if state.tool == Tool::Text {
                     return 20;
                 } else {
@@ -1544,9 +1546,18 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
             } else if let Some(handle) = s.resizing {
                 s.selected = Some(handle.resize(s.drag_initial, point, bounds));
             } else if s.moving {
-                s.selected = Some(s.drag_initial.translated(
-                    point.x - s.drag_anchor.x, point.y - s.drag_anchor.y
-                ).clamp_inside(bounds));
+                let moved = s.drag_initial.translated(
+                    point.x.saturating_sub(s.drag_anchor.x),
+                    point.y.saturating_sub(s.drag_anchor.y)
+                ).clamp_inside(bounds);
+                if let Some(previous) = s.selected {
+                    // Delta must use the CLAMPED crop, otherwise annotations
+                    // drift at monitor boundaries and after repeated drags.
+                    s.history.translate(
+                        moved.left.saturating_sub(previous.left),
+                        moved.top.saturating_sub(previous.top));
+                }
+                s.selected = Some(moved);
             } else {
                 s.selected = Rect::from_points(s.drag_anchor, point).intersection(bounds);
             }
