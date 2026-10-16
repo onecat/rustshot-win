@@ -38,6 +38,7 @@ const SW_HIDE: i32 = 0;
 const WM_DESTROY: u32 = 0x0002;
 const WM_PAINT: u32 = 0x000F;
 const WM_ERASEBKGND: u32 = 0x0014;
+const WM_SETCURSOR: u32 = 0x0020;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_DPICHANGED: u32 = 0x02E0;
@@ -209,6 +210,7 @@ extern "system" {
     fn IsWindow(hwnd: Hwnd) -> i32;
     fn LoadIconW(inst: Handle, name: *const u16) -> Handle;
     fn LoadCursorW(inst: Handle, name: *const u16) -> Handle;
+    fn SetCursor(cursor: Handle) -> Handle;
     fn CreatePopupMenu() -> Handle;
     fn AppendMenuW(menu: Handle, flags: u32, id: usize, text: *const u16) -> i32;
     fn TrackPopupMenu(menu: Handle, flags: u32, x: i32, y: i32, reserved: i32, hwnd: Hwnd, rect: *const WinRect) -> i32;
@@ -1557,6 +1559,34 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
     }
 }
 
+fn update_overlay_cursor() {
+    // System cursors are shared handles (LoadCursorW); do not delete them.
+    let id = APP.with(|cell| {
+        let state = cell.borrow();
+        let Some(frame) = &state.frame else { return 32515usize; }; // crosshair
+        let mut pointer = WinPoint::default();
+        if unsafe { GetCursorPos(&mut pointer) } == 0 { return 32515; }
+        let p = Point { x: pointer.x, y: pointer.y };
+        let Some(sel) = state.selected else { return 32515; };
+        let bar=toolbar_for(sel,frame.bounds);
+        if bar.contains(p) ||
+            (state.tool != Tool::Select && toolbar::palette_rect(bar,frame.bounds).contains(p)) {
+            return 32649; // hand over a button or palette
+        }
+        if let Some(handle) = ResizeHandle::hit_test(sel,p) {
+            return match handle {
+                ResizeHandle::NorthWest | ResizeHandle::SouthEast => 32642,
+                ResizeHandle::NorthEast | ResizeHandle::SouthWest => 32643,
+                ResizeHandle::West | ResizeHandle::East => 32644,
+                ResizeHandle::North | ResizeHandle::South => 32645,
+            };
+        }
+        if sel.contains(p) && state.tool == Tool::Select { 32646 } // move
+        else { 32515 } // crosshair
+    });
+    unsafe { SetCursor(LoadCursorW(0, id as *const u16)); }
+}
+
 fn mouse_move(hwnd: Hwnd, l: Lparam) {
     let changed = APP.with(|cell| {
         let mut s = cell.borrow_mut();
@@ -1628,7 +1658,8 @@ unsafe extern "system" fn overlay_proc(hwnd: Hwnd, message: u32, w: Wparam, l: L
     match message {
         WM_ERASEBKGND => 1, // compositor owns every pixel; never erase to white/black
         WM_PAINT => { paint_overlay(hwnd); 0 }
-        WM_MOUSEMOVE => { mouse_move(hwnd, l); 0 }
+        WM_MOUSEMOVE => { mouse_move(hwnd, l); update_overlay_cursor(); 0 }
+        WM_SETCURSOR if (l as u16) == 1 => { update_overlay_cursor(); 1 }
         WM_LBUTTONDOWN => { mouse_down(hwnd, l); 0 }
         WM_LBUTTONUP => { mouse_up(hwnd, l); 0 }
         WM_KEYDOWN if w == VK_RETURN => { finish_capture(); 0 }
