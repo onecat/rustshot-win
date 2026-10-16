@@ -122,6 +122,29 @@ pub fn slot_at(bar: Rect, point: Point) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+// Secondary palette appears only for an active drawing/text tool.
+// Returns a palette action: 30–34 = preset color, 35–37 = line 2/4/7 px.
+pub const PALETTE_COLORS: usize = 5;
+pub const PALETTE_OPTIONS: usize = 8;
+pub fn palette_rect(bar: Rect, bounds: Rect) -> Rect {
+    let width = 326.min(bounds.width().max(1));
+    let height = 42.min(bounds.height().max(1));
+    let left = bar.right.saturating_sub(width)
+        .clamp(bounds.left, bounds.right.saturating_sub(width));
+    let top = if bar.top.saturating_sub(height + 6) >= bounds.top {
+        bar.top - height - 6
+    } else {
+        bar.bottom.saturating_add(6).min(bounds.bottom - height)
+    };
+    Rect { left, top, right:left+width, bottom:top+height }
+}
+pub fn palette_hit(bar: Rect, bounds: Rect, p: Point) -> Option<usize> {
+    let r=palette_rect(bar,bounds);
+    if !r.contains(p) { return None; }
+    let cell = ((p.x - r.left) as i64 * PALETTE_OPTIONS as i64 / r.width() as i64) as usize;
+    (cell < PALETTE_OPTIONS).then_some(cell)
+}
+
 pub fn action_at(bar: Rect, point: Point) -> Option<usize> {
     slot_at(bar, point).and_then(|slot| items(bar)[slot].action)
 }
@@ -216,6 +239,23 @@ mod tests {
             assert!(hit.left >= bar.left && hit.right <= bar.right);
             let center = Point { x: (hit.left + hit.right) / 2, y: (hit.top + hit.bottom) / 2 };
             assert_eq!(action_at(bar, center), item.action);
+        }
+    }
+
+    #[test]
+    fn palette_items_work_at_virtual_desktop_edges() {
+        let bounds = Rect {left:-1400, top:-500, right:1920, bottom:1080};
+        let selection=Rect {left:-1300, top:200, right:-300, bottom:1060};
+        let bar=rect_for(selection,bounds);
+        let palette=palette_rect(bar,bounds);
+        assert!(palette.left >= bounds.left);
+        assert!(palette.right <= bounds.right);
+        for slot in 0..PALETTE_OPTIONS {
+            let center=Point {
+                x:palette.left + ((slot as i32 * 2 + 1)*palette.width())/(2*PALETTE_OPTIONS as i32),
+                y:palette.top + palette.height()/2,
+            };
+            assert_eq!(palette_hit(bar,bounds,center), Some(slot));
         }
     }
 
