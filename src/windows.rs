@@ -38,10 +38,12 @@ const SW_HIDE: i32 = 0;
 const WM_DESTROY: u32 = 0x0002;
 const WM_PAINT: u32 = 0x000F;
 const WM_ERASEBKGND: u32 = 0x0014;
+const WM_SETCURSOR: u32 = 0x0020;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_DPICHANGED: u32 = 0x02E0;
 const WM_KEYDOWN: u32 = 0x0100;
+const WM_SETFONT: u32 = 0x0030;
 const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
 const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
 const WS_CHILD: u32 = 0x40000000;
@@ -177,6 +179,7 @@ extern "system" {
         x: i32, y: i32, w: i32, h: i32, parent: Hwnd, menu: Handle, inst: Handle, param: *const c_void) -> Hwnd;
     fn DefWindowProcW(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult;
     fn DestroyWindow(hwnd: Hwnd) -> i32;
+    fn SendMessageW(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult;
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
     fn UpdateWindow(hwnd: Hwnd) -> i32;
     fn SetForegroundWindow(hwnd: Hwnd) -> i32;
@@ -207,6 +210,7 @@ extern "system" {
     fn IsWindow(hwnd: Hwnd) -> i32;
     fn LoadIconW(inst: Handle, name: *const u16) -> Handle;
     fn LoadCursorW(inst: Handle, name: *const u16) -> Handle;
+    fn SetCursor(cursor: Handle) -> Handle;
     fn CreatePopupMenu() -> Handle;
     fn AppendMenuW(menu: Handle, flags: u32, id: usize, text: *const u16) -> i32;
     fn TrackPopupMenu(menu: Handle, flags: u32, x: i32, y: i32, reserved: i32, hwnd: Hwnd, rect: *const WinRect) -> i32;
@@ -319,6 +323,7 @@ struct AppState {
     resizing: Option<ResizeHandle>,
     active_annotation: Option<Annotation>,
     text_edit: Hwnd,
+    text_font: Hobj,
     text_anchor: Point,
     ime_composing: bool,
     tool: Tool,
@@ -337,7 +342,7 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
-            dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
+            dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_font: 0, text_anchor: Point::default(),
             ime_composing: false,
             tool: Tool::Select, stroke: Stroke::default(), color_index:0, auto_save:true, auto_copy:true, toolbar_hover: None, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
     }
@@ -432,7 +437,9 @@ fn toolbar_for(selection: Rect, bounds: Rect) -> Rect {
 // Preview uses GDI for low allocation while editing. Export uses the same vector
 // records rendered into an independent BGRA crop in annotations::render.
 unsafe fn preview_annotation(dc: Hdc, a: &Annotation, origin: Point) {
-    if a.points.len() < 2 { return; }
+    // Text annotations have one anchor, while vector shapes need two points.
+    // The old blanket two-point check hid ALL committed text in the preview.
+    if !a.has_preview_geometry() { return; }
     let first = a.points[0];
     let last = *a.points.last().unwrap_or(&first);
     let to_local = |p: Point| Point { x: p.x - origin.x, y: p.y - origin.y };
@@ -488,9 +495,10 @@ fn paint_annotations(dc: Hdc, frame: &Frame, selection: Rect, history: &History,
         IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
         let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
         SetBkMode(dc, TRANSPARENT);
-        for a in history.committed.iter().chain(current) {
+        for (index, a) in history.committed.iter().chain(current).enumerate() {
             if a.tool == Tool::Mosaic {
-                preview_mosaic(dc, frame, selection, a);
+                let prior = &history.committed[..index.min(history.committed.len())];
+                preview_mosaic(dc, frame, selection, a, prior);
                 continue;
             }
             let color = u32::from_le_bytes([a.stroke.bgra[2], a.stroke.bgra[1], a.stroke.bgra[0], 0]);
@@ -565,7 +573,8 @@ fn render_text_to_pixels(pixels: &mut [u8], width: u32, height: u32,
 
 // Draw the exact pixel blocks from the captured frame, not an ornamental
 // checkerboard. Use small temporary buffers only for the obscured region.
-unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect, a: &Annotation) {
+unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect,
+    a: &Annotation, prior: &[Annotation]) {
     if a.points.len() < 2 { return; }
     let clipped = Rect::from_points(a.points[0], a.points[1])
         .intersection(selection)
@@ -582,8 +591,20 @@ unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect, a: &Annotation
         let offset = (frame_y * frame.bounds.width() as usize + frame_x) * 4;
         crop.extend_from_slice(&frame.pixels[offset..offset + w * 4]);
     }
+    // Reproduce the export order: mosaic must pixelate the already-drawn
+    // annotations, rather than reset the affected area to the original frame.
+    // The temporary buffer is bounded to the mosaic region, not the full crop.
+    let origin = Point { x: rect.left, y: rect.top };
+    for previous in prior {
+        if previous.tool == Tool::Text {
+            render_text_to_pixels(&mut crop, w as u32, h as u32, origin, previous);
+        } else {
+            annotations::render(&mut crop, w as u32, h as u32,
+                origin, std::slice::from_ref(previous));
+        }
+    }
     annotations::render(&mut crop, w as u32, h as u32,
-        Point { x: rect.left, y: rect.top }, std::slice::from_ref(a));
+        origin, std::slice::from_ref(a));
     let info = bitmap_info(rect.width(), rect.height());
     StretchDIBits(dc, rect.left - frame.bounds.left, rect.top - frame.bounds.top,
         rect.width(), rect.height(), 0, 0, rect.width(), rect.height(),
@@ -1126,7 +1147,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.7.0");
+    let title = utf16("RustShot v0.8.0");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }
@@ -1365,25 +1386,34 @@ fn start_text_edit(overlay: Hwnd) {
             state.text_edit = edit;
             state.text_anchor = position;
             state.ime_composing = false;
+            state.text_font = create_annotation_font(state.stroke.width);
+            if state.text_font != 0 {
+                SendMessageW(edit, WM_SETFONT, state.text_font as Wparam, 1);
+            }
         });
         SetFocus(edit);
     }
 }
 
 fn commit_text_edit() {
-    let (edit, position, overlay) = APP.with(|cell| {
+    let (edit, position, overlay, font) = APP.with(|cell| {
         let mut state = cell.borrow_mut();
         let edit = std::mem::replace(&mut state.text_edit, 0);
+        let font = std::mem::replace(&mut state.text_font, 0);
         state.ime_composing = false;
-        (edit, state.text_anchor, state.overlay)
+        (edit, state.text_anchor, state.overlay, font)
     });
-    if edit == 0 { return; }
+    if edit == 0 {
+        if font != 0 { unsafe { DeleteObject(font); } }
+        return;
+    }
     let words = unsafe {
         // Limit input to 512 UTF-16 units, preventing pathological label sizes.
         let count = GetWindowTextLengthW(edit).clamp(0, 512) as usize;
         let mut buffer = vec![0u16; count + 1];
         let read = GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
         DestroyWindow(edit);
+        if font != 0 { DeleteObject(font); }
         String::from_utf16_lossy(&buffer[..read.max(0) as usize])
     };
     if !words.trim().is_empty() {
@@ -1399,14 +1429,14 @@ fn commit_text_edit() {
 }
 
 fn cancel_text_edit() {
-    let (edit, overlay) = APP.with(|cell| {
+    let (edit, font, overlay) = APP.with(|cell| {
         let mut state = cell.borrow_mut();
-        {
-            state.ime_composing = false;
-            (std::mem::replace(&mut state.text_edit, 0), state.overlay)
-        }
+        state.ime_composing = false;
+        (std::mem::replace(&mut state.text_edit, 0),
+         std::mem::replace(&mut state.text_font, 0), state.overlay)
     });
     if edit != 0 { unsafe { DestroyWindow(edit); } }
+    if font != 0 { unsafe { DeleteObject(font); } }
     if overlay != 0 {
         unsafe { SetFocus(overlay); InvalidateRect(overlay, null(), 0); }
     }
@@ -1466,13 +1496,15 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
             if let Some(handle) = ResizeHandle::hit_test(selection, point) {
                 state.resizing = Some(handle);
                 state.drag_initial = selection;
-                state.history.clear();
+                // Resize only changes the crop boundary. Previous annotations
+                // remain in desktop coordinates and are clipped to the new crop.
                 state.tool = Tool::Select;
             } else if selection.contains(point) {
                 if state.tool == Tool::Select {
                     state.moving = true;
                     state.drag_initial = selection;
-                    state.history.clear();
+                    // The annotations move with the crop on mousemove, instead
+                    // of being discarded when the user repositions a capture.
                 } else if state.tool == Tool::Text {
                     return 20;
                 } else {
@@ -1530,6 +1562,39 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
     }
 }
 
+fn update_overlay_cursor() {
+    // System cursors are shared handles (LoadCursorW); do not delete them.
+    let id = APP.with(|cell| {
+        let state = cell.borrow();
+        let Some(frame) = &state.frame else { return 32515usize; }; // crosshair
+        let mut pointer = WinPoint::default();
+        if unsafe { GetCursorPos(&mut pointer) } == 0 { return 32515; }
+        let p = Point { x: pointer.x, y: pointer.y };
+        let Some(sel) = state.selected else { return 32515; };
+        let bar=toolbar_for(sel,frame.bounds);
+        if bar.contains(p) {
+            let action = toolbar::action_at(bar, p);
+            let clickable = action.is_some_and(|id|
+                id != 8 || !state.history.committed.is_empty());
+            return if clickable { 32649 } else { 32512 }; // hand or arrow
+        }
+        if state.tool != Tool::Select && toolbar::palette_rect(bar,frame.bounds).contains(p) {
+            return 32649; // palette swatches remain clickable
+        }
+        if let Some(handle) = ResizeHandle::hit_test(sel,p) {
+            return match handle {
+                ResizeHandle::NorthWest | ResizeHandle::SouthEast => 32642,
+                ResizeHandle::NorthEast | ResizeHandle::SouthWest => 32643,
+                ResizeHandle::West | ResizeHandle::East => 32644,
+                ResizeHandle::North | ResizeHandle::South => 32645,
+            };
+        }
+        if sel.contains(p) && state.tool == Tool::Select { 32646 } // move
+        else { 32515 } // crosshair
+    });
+    unsafe { SetCursor(LoadCursorW(0, id as *const u16)); }
+}
+
 fn mouse_move(hwnd: Hwnd, l: Lparam) {
     let changed = APP.with(|cell| {
         let mut s = cell.borrow_mut();
@@ -1544,9 +1609,15 @@ fn mouse_move(hwnd: Hwnd, l: Lparam) {
             } else if let Some(handle) = s.resizing {
                 s.selected = Some(handle.resize(s.drag_initial, point, bounds));
             } else if s.moving {
-                s.selected = Some(s.drag_initial.translated(
-                    point.x - s.drag_anchor.x, point.y - s.drag_anchor.y
-                ).clamp_inside(bounds));
+                let moved = crate::selection::move_crop(
+                    s.drag_initial, s.drag_anchor, point, bounds);
+                if let Some(previous) = s.selected {
+                    // Delta must use the CLAMPED crop, otherwise annotations
+                    // drift at monitor boundaries and after repeated drags.
+                    let (dx, dy) = crate::selection::crop_delta(previous, moved);
+                    s.history.translate(dx, dy);
+                }
+                s.selected = Some(moved);
             } else {
                 s.selected = Rect::from_points(s.drag_anchor, point).intersection(bounds);
             }
@@ -1592,7 +1663,8 @@ unsafe extern "system" fn overlay_proc(hwnd: Hwnd, message: u32, w: Wparam, l: L
     match message {
         WM_ERASEBKGND => 1, // compositor owns every pixel; never erase to white/black
         WM_PAINT => { paint_overlay(hwnd); 0 }
-        WM_MOUSEMOVE => { mouse_move(hwnd, l); 0 }
+        WM_MOUSEMOVE => { mouse_move(hwnd, l); update_overlay_cursor(); 0 }
+        WM_SETCURSOR if (l as u16) == 1 => { update_overlay_cursor(); 1 }
         WM_LBUTTONDOWN => { mouse_down(hwnd, l); 0 }
         WM_LBUTTONUP => { mouse_up(hwnd, l); 0 }
         WM_KEYDOWN if w == VK_RETURN => { finish_capture(); 0 }

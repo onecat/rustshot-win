@@ -2,9 +2,9 @@
 
 Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workflow inspired by desktop WeChat screenshot selection. No Electron, WebView, cloud upload, telemetry, or administrator access is required.
 
-> **Current status: v0.7.0 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
+> **Current status: v0.8.0 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
 
-## Implemented through v0.7.0
+## Implemented through v0.8.0
 
 - Single-instance notification area app, `Alt+A` global shortcut (falls back to `Ctrl+Shift+A` if occupied).
 - Take a frozen desktop snapshot **before** displaying the darkened overlay; v0.4 uses a single full-desktop BGRA buffer plus an `AlphaBlend` 1×1 black source instead of keeping a second full-sized darkened BGRA image.
@@ -26,7 +26,7 @@ Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workfl
 
 ### Keyboard / mouse quick start
 
-1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.7.0-win-x64-portable` ZIP (or build it yourself) and start it.
+1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.8.0-win-x64-portable` ZIP (or build it yourself) and start it.
 2. Press `Alt+A` (or fallback `Ctrl+Shift+A`).
 3. Drag a screenshot rectangle or click a highlighted window.
 4. Drag the green handles to resize; drag inside the selected area to move.
@@ -51,6 +51,20 @@ GitHub Actions builds with a `windows-2022` runner. A green CI run proves build,
 
 
 
+
+### v0.8.0 — selection, annotation and input hardening
+
+This version improves only **existing RustShot features**. No implementation work on emoji, OCR, translation, scrolling capture, pinning or sharing. Those gray icons remain disabled.
+
+- Moving a capture selection **no longer wipes annotations**. Each committed item and redo-history item translates with the *actual clamped* crop movement. Works with negative monitor coordinates and edge clamping.
+- Resizing a capture selection retains annotations in original desktop coordinates. Final export clips them to the new crop, and Undo/Redo history survives resizing.
+- Mosaic previews rebuild earlier vector/text annotation layers inside the mosaic region before pixelation. This avoids overwriting earlier edits with stale original pixels when a mosaic overlays an existing drawing.
+- Fixed the one-anchor text preview bug: committed Chinese/English text previously could be invisible until export, because the GDI preview unconditionally required two points. The preview check is now unit-tested.
+- Native text input uses the same font family/height as exported annotations. The Win32 EDIT control's temporary HFONT is freed after accepting or canceling text, including on overlay closure.
+- Native resize/move/hand cursors communicate selection handles, crop dragging and toolbar actions. No new background listeners, image engines or process dependencies.
+- Retains the non-flickering v0.4.1 backbuffer, current five colors, three widths, auto-save/copy flags and existing screenshot shortcuts.
+
+Manual Windows 11 QA is still necessary for keyboard/IME, cursor glyphs, mixed DPI, multi-monitor and actual image-to-preview pixel consistency. See `docs/v0.8-qa-matrix.md`.
 
 ### v0.7.0 — larger UI, styled annotations and native tray options
 

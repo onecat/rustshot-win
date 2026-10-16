@@ -61,6 +61,30 @@ impl Handle {
     }
 }
 
+/// Position a dragged screenshot crop using the original grab point.
+/// Coordinate math saturates and the final result is bounded to the desktop.
+pub fn move_crop(initial: Rect, anchor: Point, cursor: Point, desktop: Rect) -> Rect {
+    // Do not first saturate individual edges: at extreme cursor coordinates
+    // that collapses the rectangle width and makes it shrink while dragging.
+    // Clamp its ORIGIN using i64 math, retaining original crop dimensions.
+    let w = i64::from(initial.width().min(desktop.width()).max(1));
+    let h = i64::from(initial.height().min(desktop.height()).max(1));
+    let left = (i64::from(initial.left) + i64::from(cursor.x) - i64::from(anchor.x))
+        .clamp(i64::from(desktop.left), i64::from(desktop.right) - w);
+    let top = (i64::from(initial.top) + i64::from(cursor.y) - i64::from(anchor.y))
+        .clamp(i64::from(desktop.top), i64::from(desktop.bottom) - h);
+    Rect {
+        left: left as i32, top: top as i32,
+        right: (left + w) as i32, bottom: (top + h) as i32,
+    }
+}
+
+/// Apply only the actual movement after desktop clamping to annotations.
+pub fn crop_delta(previous: Rect, next: Rect) -> (i32, i32) {
+    (next.left.saturating_sub(previous.left),
+     next.top.saturating_sub(previous.top))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,4 +128,29 @@ mod tests {
         let r = Rect { left: 0, top: 0, right: 4, bottom: 4 };
         assert_eq!(Handle::hit_test(r, Point { x: 0, y: 0 }), Some(Handle::NorthWest));
     }
+    #[test]
+    fn clamped_motion_delta_does_not_drift_annotations() {
+        let bounds=Rect {left:-100,top:-40,right:500,bottom:300};
+        let initial=Rect {left:250,top:100,right:450,bottom:260};
+        let anchor=Point{x:260,y:110};
+        let at_edge=move_crop(initial,anchor,Point{x:2000,y:1200},bounds);
+        assert_eq!(at_edge,Rect {left:300,top:140,right:500,bottom:300});
+        assert_eq!(crop_delta(initial,at_edge),(50,40));
+        let beyond=move_crop(initial,anchor,Point{x:i32::MAX,y:i32::MAX},bounds);
+        assert_eq!(beyond, at_edge);
+        assert_eq!(crop_delta(at_edge,beyond),(0,0));
+        let back=move_crop(initial,anchor,Point{x:100,y:80},bounds);
+        assert_eq!(crop_delta(at_edge,back),(-210,-70));
+    }
+
+    #[test]
+    fn far_negative_cursor_keeps_original_crop_dimensions() {
+        let bounds=Rect{left:-1920,top:-1080,right:1920,bottom:1080};
+        let initial=Rect{left:0,top:0,right:700,bottom:500};
+        let dragged=move_crop(initial,Point{x:0,y:0},
+            Point{x:i32::MIN,y:i32::MIN},bounds);
+        assert_eq!((dragged.left,dragged.top),(-1920,-1080));
+        assert_eq!((dragged.width(),dragged.height()),(700,500));
+    }
+
 }
