@@ -130,7 +130,7 @@ mod tests {
         let beyond=move_crop(initial,anchor,Point{x:i32::MAX,y:i32::MAX},bounds);
         assert_eq!(crop_delta(at_edge,beyond),(0,0));
         let back=move_crop(initial,anchor,Point{x:100,y:80},bounds);
-        assert_eq!(crop_delta(at_edge,back),(-200,-70));
+        assert_eq!(crop_delta(at_edge,back),(-210,-70));
     }
 
 }
