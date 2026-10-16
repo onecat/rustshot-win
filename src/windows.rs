@@ -1569,9 +1569,14 @@ fn update_overlay_cursor() {
         let p = Point { x: pointer.x, y: pointer.y };
         let Some(sel) = state.selected else { return 32515; };
         let bar=toolbar_for(sel,frame.bounds);
-        if bar.contains(p) ||
-            (state.tool != Tool::Select && toolbar::palette_rect(bar,frame.bounds).contains(p)) {
-            return 32649; // hand over a button or palette
+        if bar.contains(p) {
+            let action = toolbar::action_at(bar, p);
+            let clickable = action.is_some_and(|id|
+                id != 8 || !state.history.committed.is_empty());
+            return if clickable { 32649 } else { 32512 }; // hand or arrow
+        }
+        if state.tool != Tool::Select && toolbar::palette_rect(bar,frame.bounds).contains(p) {
+            return 32649; // palette swatches remain clickable
         }
         if let Some(handle) = ResizeHandle::hit_test(sel,p) {
             return match handle {
