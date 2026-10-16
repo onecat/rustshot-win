@@ -33,7 +33,7 @@ impl Stroke {
     }
 }
 impl Default for Stroke {
-    fn default() -> Self { Self::preset(0, 3) }
+    fn default() -> Self { Self::preset(0, 4) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
