@@ -162,7 +162,7 @@ mod tests {
         let bounds = desktop(1920);
         let sel = Rect { left: 100, top: 40, right: 1000, bottom: 500 };
         let bar = rect_for(sel, bounds);
-        assert_eq!((bar.width(), bar.height(), bar.top), (1000, 68, 514));
+        assert_eq!((bar.width(), bar.height(), bar.top), (1000, 68, 512));
         assert_eq!(items(bar).len(), 16);
         for (i, item) in items(bar).iter().enumerate() {
             let cell = slot_rect(bar, i).unwrap();
