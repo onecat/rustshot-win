@@ -488,9 +488,10 @@ fn paint_annotations(dc: Hdc, frame: &Frame, selection: Rect, history: &History,
         IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
         let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
         SetBkMode(dc, TRANSPARENT);
-        for a in history.committed.iter().chain(current) {
+        for (index, a) in history.committed.iter().chain(current).enumerate() {
             if a.tool == Tool::Mosaic {
-                preview_mosaic(dc, frame, selection, a);
+                let prior = &history.committed[..index.min(history.committed.len())];
+                preview_mosaic(dc, frame, selection, a, prior);
                 continue;
             }
             let color = u32::from_le_bytes([a.stroke.bgra[2], a.stroke.bgra[1], a.stroke.bgra[0], 0]);
@@ -565,7 +566,8 @@ fn render_text_to_pixels(pixels: &mut [u8], width: u32, height: u32,
 
 // Draw the exact pixel blocks from the captured frame, not an ornamental
 // checkerboard. Use small temporary buffers only for the obscured region.
-unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect, a: &Annotation) {
+unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect,
+    a: &Annotation, prior: &[Annotation]) {
     if a.points.len() < 2 { return; }
     let clipped = Rect::from_points(a.points[0], a.points[1])
         .intersection(selection)
@@ -582,8 +584,20 @@ unsafe fn preview_mosaic(dc: Hdc, frame: &Frame, selection: Rect, a: &Annotation
         let offset = (frame_y * frame.bounds.width() as usize + frame_x) * 4;
         crop.extend_from_slice(&frame.pixels[offset..offset + w * 4]);
     }
+    // Reproduce the export order: mosaic must pixelate the already-drawn
+    // annotations, rather than reset the affected area to the original frame.
+    // The temporary buffer is bounded to the mosaic region, not the full crop.
+    let origin = Point { x: rect.left, y: rect.top };
+    for previous in prior {
+        if previous.tool == Tool::Text {
+            render_text_to_pixels(&mut crop, w as u32, h as u32, origin, previous);
+        } else {
+            annotations::render(&mut crop, w as u32, h as u32,
+                origin, std::slice::from_ref(previous));
+        }
+    }
     annotations::render(&mut crop, w as u32, h as u32,
-        Point { x: rect.left, y: rect.top }, std::slice::from_ref(a));
+        origin, std::slice::from_ref(a));
     let info = bitmap_info(rect.width(), rect.height());
     StretchDIBits(dc, rect.left - frame.bounds.left, rect.top - frame.bounds.top,
         rect.width(), rect.height(), 0, 0, rect.width(), rect.height(),
