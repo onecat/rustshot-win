@@ -106,7 +106,8 @@ impl History {
     }
 }
 
-const RED_BGRA: [u8; 4] = [39, 48, 232, 255];
+#[cfg(test)]
+const RED_BGRA: [u8; 4] = Stroke::COLORS[0];
 
 struct Canvas<'a> {
     pixels: &'a mut [u8],
@@ -330,8 +331,8 @@ mod tests {
         assert_eq!(history.committed[1].stroke, blue);
         let mut pixels = vec![255u8; 24*24*4];
         render(&mut pixels, 24, 24, Point{x:0,y:0}, &history.committed);
-        assert!(pixels.chunks_exact(4).any(|p| p == blue.bgra));
-        assert!(pixels.chunks_exact(4).any(|p| p == red.bgra));
+        assert!(pixels.as_chunks::<4>().0.iter().any(|p| p == &blue.bgra));
+        assert!(pixels.as_chunks::<4>().0.iter().any(|p| p == &red.bgra));
     }
 
     #[test]
