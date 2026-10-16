@@ -2,9 +2,9 @@
 
 Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workflow inspired by desktop WeChat screenshot selection. No Electron, WebView, cloud upload, telemetry, or administrator access is required.
 
-> **Current status: v0.6.1 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
+> **Current status: v0.7.0 developer preview** — Windows x64 CI compiling, linting, and unit tests are passing; **Windows 11 interactive QA is still required**. This is not yet a complete WeChat screenshot replacement.
 
-## Implemented through v0.6.1
+## Implemented through v0.7.0
 
 - Single-instance notification area app, `Alt+A` global shortcut (falls back to `Ctrl+Shift+A` if occupied).
 - Take a frozen desktop snapshot **before** displaying the darkened overlay; v0.4 uses a single full-desktop BGRA buffer plus an `AlphaBlend` 1×1 black source instead of keeping a second full-sized darkened BGRA image.
@@ -26,7 +26,7 @@ Lightweight **native Rust screenshot utility for Windows 11 x64**, with a workfl
 
 ### Keyboard / mouse quick start
 
-1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.6.1-win-x64-portable` ZIP (or build it yourself) and start it.
+1. Extract the **single** `RustShot.exe` from the workflow's `RustShot-v0.7.0-win-x64-portable` ZIP (or build it yourself) and start it.
 2. Press `Alt+A` (or fallback `Ctrl+Shift+A`).
 3. Drag a screenshot rectangle or click a highlighted window.
 4. Drag the green handles to resize; drag inside the selected area to move.
@@ -51,6 +51,19 @@ GitHub Actions builds with a `windows-2022` runner. A green CI run proves build,
 
 
 
+
+### v0.7.0 — larger UI, styled annotations and native tray options
+
+This release deliberately **does not implement OCR**. Its gray OCR/translation/scroll icons are visual placeholders only.
+
+- Enlarges the full toolbar to **1000×68 physical pixels**, or the compact layout to **668×54** (clipped by a smaller desktop); icon strokes scale further to improve readability and all mouse hit targets follow the new geometry.
+- The top-left screenshot dimension label uses a **23px character-height Segoe UI** style; tooltip text uses **19px character-height Microsoft YaHei UI**. The input editor is taller to accommodate Chinese text.
+- Selecting a drawing tool opens a small **second floating palette** next to the main toolbar: five swatches (red, blue, green, yellow and black) and three stroke widths (2, 4 and 7 px). Annotations remember their own stroke so later palette changes cannot retroactively change existing shapes.
+- Rectangle, ellipse, arrow, pen and text previews share the chosen color. The PNG export rasterizer and clipboard output use the same color and stroke width, while mosaic remains a pixelation effect.
+- The system tray now contains two additional **persistent per-user** options: `截图自动保存 PNG` and `截图自动复制`, independently enabled by default. Values are stored in `HKCU\\Software\\RustShot` as `REG_DWORD` entries. Neither needs administrator rights.
+- The **v0.4.1 double-buffered no-flicker overlay** and existing PNG save/clipboard implementation remain; no new background polling, Electron or OCR engine is introduced.
+
+**Scope boundary:** An in-app settings window, custom hotkey editor, arbitrary screenshot directory picker, OCR, pinning and scrolling captures remain future tasks. This version provides directly operable native tray settings, not a full settings page.
 
 ### v0.6.1 readability and toolbar sizing hotfix
 
