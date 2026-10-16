@@ -885,6 +885,58 @@ unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, item: toolbar::Item) {
     if saved != 0 { RestoreDC(dc, saved); }
 }
 
+fn paint_stroke_palette(dc: Hdc, selection: Rect, desktop: Rect,
+    color_index: usize, stroke_width: u8) {
+    let bar=toolbar_for(selection,desktop);
+    let palette=toolbar::palette_rect(bar,desktop);
+    let p=palette.translated(-desktop.left,-desktop.top);
+    unsafe {
+        let saved=SaveDC(dc);
+        if saved==0 {return;}
+        toolbar_rounded(dc,p,10,0x00FFFFFF,0x00DCDCDC);
+        for index in 0..toolbar::PALETTE_OPTIONS {
+            let left=p.left + index as i32*p.width()/toolbar::PALETTE_OPTIONS as i32;
+            let right=p.left + (index as i32+1)*p.width()/toolbar::PALETTE_OPTIONS as i32;
+            let cx=(left+right)/2;
+            let cy=(p.top+p.bottom)/2;
+            if index<toolbar::PALETTE_COLORS {
+                let col=Stroke::COLORS[index];
+                let rgb=u32::from_le_bytes([col[2],col[1],col[0],0]);
+                let b=CreateSolidBrush(rgb);
+                if b!=0 {
+                    let old=SelectObject(dc,b);
+                    let pen=CreatePen(PS_SOLID,if index==color_index {3}else{1},
+                        if index==color_index {0x00666666}else{0x00EEEEEE});
+                    if pen!=0 {
+                        let old_pen=SelectObject(dc,pen);
+                        Ellipse(dc,cx-9,cy-9,cx+10,cy+10);
+                        SelectObject(dc,old_pen);DeleteObject(pen);
+                    }
+                    SelectObject(dc,old);DeleteObject(b);
+                }
+            }else{
+                let w=[2u8,4,7][index-5];
+                let pen=CreatePen(PS_SOLID,i32::from(w),0x00444444);
+                if pen!=0 {
+                    let old=SelectObject(dc,pen);
+                    MoveToEx(dc,cx-11,cy,null_mut()); LineTo(dc,cx+11,cy);
+                    SelectObject(dc,old);DeleteObject(pen);
+                }
+                if w==stroke_width {
+                    let mark=CreatePen(PS_SOLID,1,0x00C5B24B);
+                    if mark!=0 {
+                        let old=SelectObject(dc,mark);
+                        let previous=SelectObject(dc,GetStockObject(NULL_BRUSH));
+                        RoundRect(dc,left+3,p.top+3,right-3,p.bottom-3,7,7);
+                        SelectObject(dc,previous);SelectObject(dc,old);DeleteObject(mark);
+                    }
+                }
+            }
+        }
+        RestoreDC(dc,saved);
+    }
+}
+
 fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
     hover: Option<usize>, can_undo: bool, _can_redo: bool) {
     let bar = toolbar_for(selection, desktop);
@@ -1046,6 +1098,10 @@ fn paint_overlay(hwnd: Hwnd) {
                     draw_toolbar(dc, selection, frame.bounds, state.tool,
                         state.toolbar_hover, !state.history.committed.is_empty(),
                         !state.history.undone.is_empty());
+                    if state.tool != Tool::Select {
+                        paint_stroke_palette(dc,selection,frame.bounds,
+                            state.color_index,state.stroke.width);
+                    }
                 }
             }
             if surface.is_some() {
@@ -1324,7 +1380,11 @@ fn commit_text_edit() {
         String::from_utf16_lossy(&buffer[..read.max(0) as usize])
     };
     if !words.trim().is_empty() {
-        APP.with(|cell| cell.borrow_mut().history.push(Annotation::text_at(position, words).with_stroke(state.stroke)));
+        APP.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let annotation = Annotation::text_at(position, words).with_stroke(state.stroke);
+            state.history.push(annotation);
+        });
     }
     if overlay != 0 {
         unsafe { SetFocus(overlay); InvalidateRect(overlay, null(), 0); }
