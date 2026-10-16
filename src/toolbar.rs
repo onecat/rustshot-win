@@ -3,11 +3,11 @@
 //! disabled buttons and clicks cannot drift. All units are physical pixels.
 use crate::geometry::{Point, Rect};
 
-// Gently enlarge v0.6 bars while keeping the measured icon-center ratios.
-pub const FULL_WIDTH: i32 = 900;
-pub const FULL_HEIGHT: i32 = 60;
-pub const COMPACT_WIDTH: i32 = 608;
-pub const COMPACT_HEIGHT: i32 = 47;
+// v0.7 readability pass: 1000px full and 668px compact bar, capped by desktop.
+pub const FULL_WIDTH: i32 = 1000;
+pub const FULL_HEIGHT: i32 = 68;
+pub const COMPACT_WIDTH: i32 = 668;
+pub const COMPACT_HEIGHT: i32 = 54;
 
 // Center coordinates below were measured at these original reference widths.
 // Slot bounds are scaled to the current bar, so paint and hit tests agree.
@@ -62,7 +62,7 @@ const FULL_SEPARATORS: [(usize, usize); 2] = [(6, 7), (9, 10)];
 const COMPACT_SEPARATORS: [(usize, usize); 2] = [(6, 7), (7, 8)];
 
 pub fn is_compact(bounds: Rect) -> bool {
-    bounds.width() < 900
+    bounds.width() < 1050
 }
 
 pub fn items(bar: Rect) -> &'static [Item] {
@@ -83,7 +83,7 @@ pub fn rect_for(selection: Rect, bounds: Rect) -> Rect {
     // aligns its right edge to the crop's right edge when screen space allows.
     let x = selection.right.saturating_sub(width)
         .clamp(bounds.left, bounds.right.saturating_sub(width));
-    let gap = if small { 3 } else { 14 };
+    let gap = if small { 4 } else { 12 };
     let below = selection.bottom.saturating_add(gap);
     let y = if below.saturating_add(height) <= bounds.bottom {
         below
@@ -139,7 +139,7 @@ mod tests {
         let bounds = desktop(1920);
         let sel = Rect { left: 100, top: 40, right: 1000, bottom: 500 };
         let bar = rect_for(sel, bounds);
-        assert_eq!((bar.width(), bar.height(), bar.top), (900, 60, 514));
+        assert_eq!((bar.width(), bar.height(), bar.top), (1000, 68, 514));
         assert_eq!(items(bar).len(), 16);
         for (i, item) in items(bar).iter().enumerate() {
             let cell = slot_rect(bar, i).unwrap();
@@ -157,9 +157,9 @@ mod tests {
         let bounds = desktop(638);
         let sel = Rect { left: 20, top: 30, right: 505, bottom: 334 };
         let bar = rect_for(sel, bounds);
-        assert_eq!(bar.width(), 608);
-        assert_eq!(bar.height(), 47);
-        assert_eq!(bar.top, 337);
+        assert_eq!(bar.width(), 638);
+        assert_eq!(bar.height(), 54);
+        assert_eq!(bar.top, 338);
         assert_eq!(items(bar).len(), 12);
         for (i, item) in items(bar).iter().enumerate() {
             let rect = slot_rect(bar, i).unwrap();
@@ -207,12 +207,12 @@ mod tests {
         let bounds = desktop(1920);
         let selection = Rect { left: 1150, top: 100, right: 1800, bottom: 980 };
         let bar = rect_for(selection, bounds);
-        assert_eq!((bar.width(), bar.height()), (900, 60));
+        assert_eq!((bar.width(), bar.height()), (1000, 68));
         assert!(bar.left >= bounds.left && bar.right <= bounds.right);
         assert!(bar.top < selection.top || bar.bottom <= bounds.bottom);
         for (index, item) in items(bar).iter().enumerate() {
             let hit = slot_rect(bar, index).unwrap();
-            assert!(hit.width() >= 45, "icon hit target should grow with the bar");
+            assert!(hit.width() >= 51, "icon hit target should grow with the bar");
             assert!(hit.left >= bar.left && hit.right <= bar.right);
             let center = Point { x: (hit.left + hit.right) / 2, y: (hit.top + hit.bottom) / 2 };
             assert_eq!(action_at(bar, center), item.action);
