@@ -1,6 +1,6 @@
 //! Minimal native Win32/GDI baseline for the first screenshot PoC.
 //! No external crates; unsafe FFI calls are isolated here. Windows 11 validation is pending.
-use crate::annotations::{self, Annotation, History, Tool};
+use crate::annotations::{self, Annotation, History, Stroke, Tool};
 use std::os::windows::ffi::OsStrExt;
 use crate::geometry::{Point, Rect};
 use crate::selection::Handle as ResizeHandle;
@@ -51,6 +51,7 @@ const ES_AUTOHSCROLL: u32 = 0x0080;
 const MF_CHECKED: u32 = 0x0008;
 const HKEY_CURRENT_USER: Handle = 0x80000001u32 as Handle;
 const REG_SZ: u32 = 1;
+const REG_DWORD: u32 = 4;
 const KEY_QUERY_VALUE: u32 = 0x0001;
 const KEY_SET_VALUE: u32 = 0x0002;
 const WM_HOTKEY: u32 = 0x0312;
@@ -321,6 +322,10 @@ struct AppState {
     text_anchor: Point,
     ime_composing: bool,
     tool: Tool,
+    stroke: Stroke,
+    color_index: usize,
+    auto_save: bool,
+    auto_copy: bool,
     toolbar_hover: Option<usize>,
     history: History,
     drag_anchor: Point,
@@ -334,7 +339,7 @@ impl AppState {
         Self { main: 0, overlay: 0, frame: None, hover: None, selected: None,
             dragging: false, moving: false, resizing: None, active_annotation: None, text_edit: 0, text_anchor: Point::default(),
             ime_composing: false,
-            tool: Tool::Select, toolbar_hover: None, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
+            tool: Tool::Select, stroke: Stroke::default(), color_index:0, auto_save:true, auto_copy:true, toolbar_hover: None, history: History::default(), drag_anchor: Point::default(), drag_initial: Rect::default(), fallback_hotkey: false, restore_focus: 0, writers: Vec::new() }
     }
 }
 thread_local! { static APP: RefCell<AppState> = RefCell::new(AppState::new()); }
@@ -481,32 +486,36 @@ fn paint_annotations(dc: Hdc, frame: &Frame, selection: Rect, history: &History,
         if saved == 0 { return; }
         let area = selection.translated(-origin.x, -origin.y);
         IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
-        let pen = CreatePen(PS_SOLID, 3, 0x00E83027);
-        if pen != 0 {
-            let old_pen = SelectObject(dc, pen);
-            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            let font = create_annotation_font();
-            let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, 0x002730E8);
-            for a in history.committed.iter().chain(current) {
-                if a.tool == Tool::Mosaic { preview_mosaic(dc, frame, selection, a); }
-                else { preview_annotation(dc, a, origin); }
+        let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        SetBkMode(dc, TRANSPARENT);
+        for a in history.committed.iter().chain(current) {
+            if a.tool == Tool::Mosaic {
+                preview_mosaic(dc, frame, selection, a);
+                continue;
             }
+            let color = u32::from_le_bytes([a.stroke.bgra[2], a.stroke.bgra[1], a.stroke.bgra[0], 0]);
+            let pen = CreatePen(PS_SOLID, i32::from(a.stroke.width), color);
+            if pen == 0 { continue; }
+            let old_pen = SelectObject(dc, pen);
+            SetTextColor(dc, color);
+            let font = create_annotation_font(a.stroke.width);
+            let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
+            preview_annotation(dc, a, origin);
             if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
-            SelectObject(dc, old_brush);
             SelectObject(dc, old_pen);
             DeleteObject(pen);
         }
+        SelectObject(dc, old_brush);
         RestoreDC(dc, saved);
     }
 }
 
 
-fn create_annotation_font() -> Hobj {
+fn create_annotation_font(width: u8) -> Hobj {
     let face = utf16("Microsoft YaHei UI");
+    let height = -(26 + i32::from(width.saturating_sub(1)) * 2);
     unsafe {
-        CreateFontW(22, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, face.as_ptr())
+        CreateFontW(height, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, face.as_ptr())
     }
 }
 
@@ -533,10 +542,13 @@ fn render_text_to_pixels(pixels: &mut [u8], width: u32, height: u32,
         }
         let old_bmp = SelectObject(dc, bmp);
         std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
-        let font = create_annotation_font();
+        let font = create_annotation_font(annotation.stroke.width);
         let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, 0x002730E8);
+        SetTextColor(dc, u32::from_le_bytes([
+            annotation.stroke.bgra[2], annotation.stroke.bgra[1],
+            annotation.stroke.bgra[0], 0
+        ]));
         let string = utf16(&annotation.text);
         let position = annotation.points[0];
         TextOutW(dc, position.x - origin.x, position.y - origin.y,
@@ -706,7 +718,7 @@ unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, item: toolbar::Item) {
     // existing drawing commands without changing the screenshot image itself.
     let saved = SaveDC(dc);
     if saved != 0 && SetGraphicsMode(dc, GM_ADVANCED) != 0 {
-        let scale = if bounds.height() >= 44 { 1.17_f32 } else { 1.20_f32 };
+        let scale = if bounds.height() >= 44 { 1.35_f32 } else { 1.32_f32 };
         let transform = Xform {
             m11: scale, m12: 0.0, m21: 0.0, m22: scale,
             dx: (1.0-scale) * cx as f32,
@@ -876,6 +888,58 @@ unsafe fn draw_toolbar_icon(dc: Hdc, bounds: Rect, item: toolbar::Item) {
     if saved != 0 { RestoreDC(dc, saved); }
 }
 
+fn paint_stroke_palette(dc: Hdc, selection: Rect, desktop: Rect,
+    color_index: usize, stroke_width: u8) {
+    let bar=toolbar_for(selection,desktop);
+    let palette=toolbar::palette_rect(bar,desktop);
+    let p=palette.translated(-desktop.left,-desktop.top);
+    unsafe {
+        let saved=SaveDC(dc);
+        if saved==0 {return;}
+        toolbar_rounded(dc,p,10,0x00FFFFFF,0x00DCDCDC);
+        for index in 0..toolbar::PALETTE_OPTIONS {
+            let left=p.left + index as i32*p.width()/toolbar::PALETTE_OPTIONS as i32;
+            let right=p.left + (index as i32+1)*p.width()/toolbar::PALETTE_OPTIONS as i32;
+            let cx=(left+right)/2;
+            let cy=(p.top+p.bottom)/2;
+            if index<toolbar::PALETTE_COLORS {
+                let col=Stroke::COLORS[index];
+                let rgb=u32::from_le_bytes([col[2],col[1],col[0],0]);
+                let b=CreateSolidBrush(rgb);
+                if b!=0 {
+                    let old=SelectObject(dc,b);
+                    let pen=CreatePen(PS_SOLID,if index==color_index {3}else{1},
+                        if index==color_index {0x00666666}else{0x00EEEEEE});
+                    if pen!=0 {
+                        let old_pen=SelectObject(dc,pen);
+                        Ellipse(dc,cx-9,cy-9,cx+10,cy+10);
+                        SelectObject(dc,old_pen);DeleteObject(pen);
+                    }
+                    SelectObject(dc,old);DeleteObject(b);
+                }
+            }else{
+                let w=[2u8,4,7][index-5];
+                let pen=CreatePen(PS_SOLID,i32::from(w),0x00444444);
+                if pen!=0 {
+                    let old=SelectObject(dc,pen);
+                    MoveToEx(dc,cx-11,cy,null_mut()); LineTo(dc,cx+11,cy);
+                    SelectObject(dc,old);DeleteObject(pen);
+                }
+                if w==stroke_width {
+                    let mark=CreatePen(PS_SOLID,1,0x00C5B24B);
+                    if mark!=0 {
+                        let old=SelectObject(dc,mark);
+                        let previous=SelectObject(dc,GetStockObject(NULL_BRUSH));
+                        RoundRect(dc,left+3,p.top+3,right-3,p.bottom-3,7,7);
+                        SelectObject(dc,previous);SelectObject(dc,old);DeleteObject(mark);
+                    }
+                }
+            }
+        }
+        RestoreDC(dc,saved);
+    }
+}
+
 fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
     hover: Option<usize>, can_undo: bool, _can_redo: bool) {
     let bar = toolbar_for(selection, desktop);
@@ -884,7 +948,7 @@ fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
     unsafe {
         let saved = SaveDC(dc);
         if saved == 0 { return; }
-        let radius = if toolbar::is_compact(desktop) { 10 } else { 14 };
+        let radius = if toolbar::is_compact(desktop) { 11 } else { 16 };
         // Soft one-pixel outline and low elevation, matching supplied images.
         toolbar_rounded(dc, Rect {
             left: local.left + 1, top: local.top + 3,
@@ -936,24 +1000,24 @@ fn draw_toolbar(dc: Hdc, selection: Rect, desktop: Rect, active: Tool,
                 // height; avoid clipping longer disabled-action tooltips.
                 let text_width: i32 = label.chars()
                     .map(|ch| if ch.is_ascii() { 9 } else { 17 }).sum();
-                let width = (text_width + 20).clamp(62, 260).min(desktop.width());
+                let width = (text_width + 35).clamp(72, 300).min(desktop.width());
                 let left = (cell.left + cell.width()/2 - width/2)
                     .clamp(desktop.left, desktop.right.saturating_sub(width));
-                let y = if bar.bottom.saturating_add(33) <= desktop.bottom {
+                let y = if bar.bottom.saturating_add(39) <= desktop.bottom {
                     bar.bottom + 4
                 } else {
-                    bar.top.saturating_sub(31).max(desktop.top)
+                    bar.top.saturating_sub(37).max(desktop.top)
                 };
                 let tip = Rect { left: left-origin.x, top: y-origin.y,
-                    right: left+width-origin.x, bottom: y+27-origin.y };
+                    right: left+width-origin.x, bottom: y+32-origin.y };
                 toolbar_rounded(dc, tip, 5, 0x00484848, 0x00484848);
                 let glyphs = utf16(label);
                 let face = utf16("Microsoft YaHei UI");
-                let font = CreateFontW(-16,0,0,0,400,0,0,0,1,0,0,4,0,face.as_ptr());
+                let font = CreateFontW(-19,0,0,0,500,0,0,0,1,0,0,4,0,face.as_ptr());
                 let old = if font != 0 { SelectObject(dc, font) } else { 0 };
                 SetTextColor(dc,0x00FFFFFF);
                 SetBkMode(dc,TRANSPARENT);
-                TextOutW(dc,tip.left + 8,tip.top + 4,glyphs.as_ptr(),glyphs.len() as i32-1);
+                TextOutW(dc,tip.left + 9,tip.top + 5,glyphs.as_ptr(),glyphs.len() as i32-1);
                 if font != 0 {SelectObject(dc,old);DeleteObject(font);}
             }
         }
@@ -1013,9 +1077,9 @@ fn paint_overlay(hwnd: Hwnd) {
                 let caption = format!("{} x {}", selection.width(), selection.height());
                 let label = utf16(&caption);
                 let face = utf16("Segoe UI");
-                let font = CreateFontW(-18,0,0,0,500,0,0,0,1,0,0,4,0,face.as_ptr());
+                let font = CreateFontW(-23,0,0,0,600,0,0,0,1,0,0,4,0,face.as_ptr());
                 let old_font = if font != 0 { SelectObject(dc, font) } else { 0 };
-                TextOutW(dc, rel.left + 1, rel.top.saturating_sub(25).max(0),
+                TextOutW(dc, rel.left + 1, rel.top.saturating_sub(31).max(0),
                     label.as_ptr(), label.len() as i32 - 1);
                 if font != 0 { SelectObject(dc, old_font); DeleteObject(font); }
                 if state.selected.is_some() {
@@ -1037,6 +1101,10 @@ fn paint_overlay(hwnd: Hwnd) {
                     draw_toolbar(dc, selection, frame.bounds, state.tool,
                         state.toolbar_hover, !state.history.committed.is_empty(),
                         !state.history.undone.is_empty());
+                    if state.tool != Tool::Select {
+                        paint_stroke_palette(dc,selection,frame.bounds,
+                            state.color_index,state.stroke.width);
+                    }
                 }
             }
             if surface.is_some() {
@@ -1058,7 +1126,7 @@ fn paint_overlay(hwnd: Hwnd) {
 
 fn alert(hwnd: Hwnd, message: &str) {
     let msg = utf16(message);
-    let title = utf16("RustShot v0.6.1");
+    let title = utf16("RustShot v0.7.0");
     // SAFETY: UTF-16 buffers are NUL terminated for the duration of MessageBoxW.
     unsafe { MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), 0x30); }
 }
@@ -1239,36 +1307,40 @@ fn save_png(width: u32, height: u32, pixels: &[u8]) -> io::Result<PathBuf> {
 fn finish_capture() {
     commit_text_edit();
     let picture = selected_image();
-    let owner = APP.with(|s| s.borrow().main);
+    let (owner,auto_copy,auto_save) = APP.with(|cell| {
+        let s=cell.borrow();
+        (s.main,s.auto_copy,s.auto_save)
+    });
     close_overlay();
-    let Some((w, h, pixels)) = picture else { return; };
-    let copied = put_clipboard(owner, w, h, &pixels);
-    // Reap completed workers and bound simultaneous full-resolution exports.
-    // When saving two screenshots is still in progress, wait for the oldest
-    // before starting another. This rare backpressure keeps memory bounded.
-    let oldest = APP.with(|cell| {
-        let mut app = cell.borrow_mut();
-        let mut i = 0;
-        while i < app.writers.len() {
-            if app.writers[i].is_finished() {
-                let completed = app.writers.remove(i);
-                let _ = completed.join();
-            } else { i += 1; }
-        }
-        if app.writers.len() >= MAX_CONCURRENT_SAVES {
-            Some(app.writers.remove(0))
-        } else { None }
-    });
-    if let Some(worker) = oldest { let _ = worker.join(); }
-    let worker = thread::spawn(move || {
-        if let Err(err) = save_png(w, h, &pixels) {
-            alert(0, &format!("Screenshot was not saved: {err}"));
-        }
-    });
-    APP.with(|cell| cell.borrow_mut().writers.push(worker));
-    if let Err(err) = copied { alert(owner, &format!("Clipboard copy failed; PNG save will still be attempted: {err}")); }
+    let Some((w,h,pixels))=picture else {return};
+    let copied = if auto_copy {Some(put_clipboard(owner,w,h,&pixels))} else {None};
+    if auto_save {
+        // Release finished writers; never queue more than two full BGRA crops.
+        let oldest=APP.with(|cell| {
+            let mut app=cell.borrow_mut();
+            let mut i=0;
+            while i<app.writers.len() {
+                if app.writers[i].is_finished() {
+                    let finished=app.writers.remove(i);
+                    let _=finished.join();
+                } else {i+=1;}
+            }
+            if app.writers.len()>=MAX_CONCURRENT_SAVES {
+                Some(app.writers.remove(0))
+            } else {None}
+        });
+        if let Some(worker)=oldest {let _=worker.join();}
+        let worker=thread::spawn(move || {
+            if let Err(err)=save_png(w,h,&pixels) {
+                alert(0,&format!("Screenshot PNG save failed: {err}"));
+            }
+        });
+        APP.with(|cell| cell.borrow_mut().writers.push(worker));
+    }
+    if let Some(Err(err))=copied {
+        alert(owner,&format!("Clipboard copy failed; automatic PNG saving setting is independent: {err}"));
+    }
 }
-
 
 fn start_text_edit(overlay: Hwnd) {
     cancel_text_edit();
@@ -1281,7 +1353,7 @@ fn start_text_edit(overlay: Hwnd) {
     let x = (position.x - bounds.left).clamp(0, (bounds.width() - 1).max(0));
     let y = (position.y - bounds.top).clamp(0, (bounds.height() - 1).max(0));
     let width = 300.min((bounds.width() - x).max(1));
-    let height = 32.min((bounds.height() - y).max(1));
+    let height = 40.min((bounds.height() - y).max(1));
     let class = utf16("EDIT");
     unsafe {
         let edit = CreateWindowExW(0, class.as_ptr(), utf16("").as_ptr(),
@@ -1315,7 +1387,11 @@ fn commit_text_edit() {
         String::from_utf16_lossy(&buffer[..read.max(0) as usize])
     };
     if !words.trim().is_empty() {
-        APP.with(|cell| cell.borrow_mut().history.push(Annotation::text_at(position, words)));
+        APP.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let annotation = Annotation::text_at(position, words).with_stroke(state.stroke);
+            state.history.push(annotation);
+        });
     }
     if overlay != 0 {
         unsafe { SetFocus(overlay); InvalidateRect(overlay, null(), 0); }
@@ -1372,6 +1448,11 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         let bounds = frame.bounds;
         if let Some(selection) = state.selected {
             let bar = toolbar_for(selection, bounds);
+            if state.tool != Tool::Select {
+                if let Some(slot) = toolbar::palette_hit(bar, bounds, point) {
+                    return 30 + slot;
+                }
+            }
             if bar.contains(point) {
                 // The gaps between WeChat-style button groups are inert.
                 return toolbar::action_at(bar, point).unwrap_or(21);
@@ -1395,7 +1476,7 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
                 } else if state.tool == Tool::Text {
                     return 20;
                 } else {
-                    state.active_annotation = Some(Annotation::begin(state.tool, point));
+                    state.active_annotation = Some(Annotation::begin(state.tool, point).with_stroke(state.stroke));
                 }
             } else {
                 state.selected = None;
@@ -1432,6 +1513,19 @@ fn mouse_down(hwnd: Hwnd, l: Lparam) {
         11 => close_overlay(),
         20 => start_text_edit(hwnd),
         21 => {}, // disabled toolbar items / group separators are inert
+        30..=37 => {
+            APP.with(|cell| {
+                let mut state = cell.borrow_mut();
+                if action <= 34 {
+                    state.color_index = action - 30;
+                    state.stroke = Stroke::preset(state.color_index, state.stroke.width);
+                } else {
+                    let widths=[2u8,4,7];
+                    state.stroke = Stroke::preset(state.color_index, widths[action-35]);
+                }
+            });
+            unsafe { InvalidateRect(hwnd, null(), 0); }
+        },
         _ => { unsafe { SetCapture(hwnd); } }
     }
 }
@@ -1604,6 +1698,37 @@ fn set_startup(enabled: bool) -> Result<(), String> {
     else { Err(format!("Unable to change Windows startup registry value: {code}")) }
 }
 
+const SETTINGS_KEY: &str = "Software\\RustShot";
+fn open_settings_key() -> Result<Handle, String> {
+    let mut handle=0;
+    let key=utf16(SETTINGS_KEY);
+    let result=unsafe {RegCreateKeyExW(HKEY_CURRENT_USER,key.as_ptr(),0,null_mut(),
+        0,KEY_QUERY_VALUE|KEY_SET_VALUE,null(),&mut handle,null_mut())};
+    if result==0 {Ok(handle)} else {Err(format!("Settings registry access: {result}"))}
+}
+fn read_setting(name: &str, fallback: bool) -> bool {
+    let Ok(key)=open_settings_key() else {return fallback};
+    let value=utf16(name);
+    let mut raw=[0u8;4];
+    let mut len=4u32;
+    let mut kind=0u32;
+    let result=unsafe {RegQueryValueExW(key,value.as_ptr(),null_mut(),&mut kind,
+        raw.as_mut_ptr(),&mut len)};
+    unsafe {RegCloseKey(key);}
+    if result==0 && kind==REG_DWORD && len==4 {
+        u32::from_le_bytes(raw)!=0
+    } else {fallback}
+}
+fn set_setting(name: &str, enabled: bool) -> Result<(),String> {
+    let key=open_settings_key()?;
+    let value=utf16(name);
+    let raw=(enabled as u32).to_le_bytes();
+    let result=unsafe {RegSetValueExW(key,value.as_ptr(),0,REG_DWORD,
+        raw.as_ptr(),raw.len() as u32)};
+    unsafe {RegCloseKey(key);}
+    if result==0 {Ok(())} else {Err(format!("Cannot update {name}: {result}"))}
+}
+
 fn show_tray_menu(hwnd: Hwnd) {
     // SAFETY: Created menu is destroyed once; TrackPopupMenu returns the selected ID.
     unsafe {
@@ -1614,11 +1739,19 @@ fn show_tray_menu(hwnd: Hwnd) {
         let startup = startup_enabled().unwrap_or(false);
         let toggle = utf16(if startup { "开机启动：已开启 / Disable" }
                            else { "开机启动：已关闭 / Enable" });
+        let (auto_save,auto_copy)=APP.with(|cell| {
+            let state=cell.borrow();
+            (state.auto_save,state.auto_copy)
+        });
+        let save_text=utf16("截图自动保存 PNG / Auto save");
+        let copy_text=utf16("截图自动复制 / Auto copy");
         let quit = utf16("退出 / Exit");
         AppendMenuW(menu, MF_STRING, 1, take.as_ptr());
         AppendMenuW(menu, MF_STRING, 2, folder.as_ptr());
         AppendMenuW(menu, MF_STRING | if startup { MF_CHECKED } else { 0 },
             3, toggle.as_ptr());
+        AppendMenuW(menu,MF_STRING|if auto_save{MF_CHECKED}else{0},5,save_text.as_ptr());
+        AppendMenuW(menu,MF_STRING|if auto_copy{MF_CHECKED}else{0},6,copy_text.as_ptr());
         AppendMenuW(menu, MF_STRING, 4, quit.as_ptr());
         let mut point = WinPoint::default();
         GetCursorPos(&mut point);
@@ -1638,6 +1771,20 @@ fn show_tray_menu(hwnd: Hwnd) {
             3 => {
                 if let Err(err) = set_startup(!startup) {
                     alert(hwnd, &format!("Startup setting failed: {err}"));
+                }
+            },
+            5 | 6 => {
+                let (name,new_value)=if selection==5 {
+                    ("AutoSave",!auto_save)
+                } else {
+                    ("AutoCopy",!auto_copy)
+                };
+                match set_setting(name,new_value) {
+                    Ok(()) => APP.with(|cell| {
+                        let mut s=cell.borrow_mut();
+                        if selection==5 {s.auto_save=new_value;} else {s.auto_copy=new_value;}
+                    }),
+                    Err(err)=>alert(hwnd,&err),
                 }
             },
             4 => { DestroyWindow(hwnd); },
@@ -1688,7 +1835,12 @@ pub fn run() {
         let hwnd = CreateWindowExW(0, main_class.as_ptr(), main_class.as_ptr(), 0,
             0, 0, 0, 0, 0, 0, inst, null());
         if hwnd == 0 { alert(0, "Cannot initialize RustShot."); CloseHandle(mutex); return; }
-        APP.with(|s| s.borrow_mut().main = hwnd);
+        APP.with(|cell| {
+            let mut s=cell.borrow_mut();
+            s.main=hwnd;
+            s.auto_save=read_setting("AutoSave",true);
+            s.auto_copy=read_setting("AutoCopy",true);
+        });
         // Hotkey conflicts are not overridden: fall back to Ctrl+Shift+A.
         let fallback = if RegisterHotKey(hwnd, 1, MOD_ALT | MOD_NOREPEAT, b'A' as u32) == 0 {
             if RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, b'A' as u32) == 0 {

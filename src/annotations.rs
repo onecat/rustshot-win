@@ -14,19 +14,46 @@ pub enum Tool {
 }
 
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stroke {
+    /// Windows DIB BGRA bytes. Alpha always opaque.
+    pub bgra: [u8; 4],
+    pub width: u8,
+}
+impl Stroke {
+    pub const COLORS: [[u8; 4]; 5] = [
+        [39, 48, 232, 255],    // red
+        [224, 116, 52, 255],   // blue
+        [71, 166, 37, 255],    // green
+        [37, 190, 245, 255],   // yellow
+        [20, 20, 20, 255],     // black
+    ];
+    pub fn preset(index: usize, width: u8) -> Self {
+        Self { bgra: Self::COLORS[index.min(4)], width: width.clamp(1, 9) }
+    }
+}
+impl Default for Stroke {
+    fn default() -> Self { Self::preset(0, 4) }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Annotation {
     pub tool: Tool,
     pub points: Vec<Point>,
     pub text: String,
+    pub stroke: Stroke,
 }
 
 impl Annotation {
     pub fn begin(tool: Tool, point: Point) -> Self {
-        Self { tool, points: vec![point, point], text: String::new() }
+        Self { tool, points: vec![point, point], text: String::new(), stroke: Stroke::default() }
     }
     pub fn text_at(point: Point, text: String) -> Self {
-        Self { tool: Tool::Text, points: vec![point], text }
+        Self { tool: Tool::Text, points: vec![point], text, stroke: Stroke::default() }
+    }
+    pub fn with_stroke(mut self, stroke: Stroke) -> Self {
+        self.stroke = stroke;
+        self
     }
     pub fn update(&mut self, point: Point) {
         if self.tool == Tool::Pen {
@@ -79,13 +106,15 @@ impl History {
     }
 }
 
-const RED_BGRA: [u8; 4] = [39, 48, 232, 255];
+#[cfg(test)]
+const RED_BGRA: [u8; 4] = Stroke::COLORS[0];
 
 struct Canvas<'a> {
     pixels: &'a mut [u8],
     width: usize,
     height: usize,
     origin: Point,
+    stroke: Stroke,
 }
 
 impl Canvas<'_> {
@@ -97,13 +126,17 @@ impl Canvas<'_> {
         }
         let index = (py as usize * self.width + px as usize) * 4;
         if let Some(pixel) = self.pixels.get_mut(index..index + 4) {
-            pixel.copy_from_slice(&RED_BGRA);
+            pixel.copy_from_slice(&self.stroke.bgra);
         }
     }
 
     fn thick_dot(&mut self, x: i32, y: i32) {
-        for oy in -1..=1 {
-            for ox in -1..=1 { self.dot(x.saturating_add(ox), y.saturating_add(oy)); }
+        let radius = i32::from(self.stroke.width.saturating_sub(1)) / 2;
+        let trailing = i32::from(self.stroke.width) - radius - 1;
+        for oy in -radius..=trailing {
+            for ox in -radius..=trailing {
+                self.dot(x.saturating_add(ox), y.saturating_add(oy));
+            }
         }
     }
 
@@ -176,8 +209,9 @@ pub fn render(
     if w == 0 || h == 0 || w.checked_mul(h).and_then(|v| v.checked_mul(4)) != Some(pixels.len()) {
         return;
     }
-    let mut canvas = Canvas { pixels, width: w, height: h, origin };
+    let mut canvas = Canvas { pixels, width: w, height: h, origin, stroke: Stroke::default() };
     for annotation in annotations {
+        canvas.stroke = annotation.stroke;
         let Some(&a) = annotation.points.first() else { continue; };
         let b = *annotation.points.last().unwrap_or(&a);
         match annotation.tool {
@@ -238,7 +272,7 @@ mod tests {
         assert!(h.undo());
         h.push(Annotation { tool: Tool::Pen, points: vec![
             Point { x: 0, y: 0 }, Point { x: 1, y: 1 }, Point { x: 2, y: 2 },
-        ], text: String::new() });
+        ], text: String::new(), stroke: Stroke::default() });
         assert!(!h.redo());
     }
 
@@ -278,6 +312,33 @@ mod tests {
         assert_eq!(history.committed[0], annotation);
         history.push(Annotation::text_at(Point {x:0,y:0}, " ".into()));
         assert_eq!(history.committed.len(), 1);
+    }
+
+    #[test]
+    fn each_annotation_keeps_its_own_color_and_thickness_after_undo() {
+        let red = Stroke::preset(0, 3);
+        let blue = Stroke::preset(1, 7);
+        let mut history = History::default();
+        let a = Annotation::begin(Tool::Rectangle, Point {x: 1, y: 1}).with_stroke(red);
+        let mut a = a; a.update(Point {x: 12, y: 12});
+        history.push(a);
+        let mut b = Annotation::begin(Tool::Pen, Point {x: 16, y: 16}).with_stroke(blue);
+        b.update(Point {x: 17, y: 17}); b.update(Point {x: 18, y: 18});
+        history.push(b);
+        assert!(history.undo());
+        assert!(history.redo());
+        assert_eq!(history.committed[0].stroke, red);
+        assert_eq!(history.committed[1].stroke, blue);
+        let mut pixels = vec![255u8; 24*24*4];
+        render(&mut pixels, 24, 24, Point{x:0,y:0}, &history.committed);
+        assert!(pixels.as_chunks::<4>().0.iter().any(|p| p == &blue.bgra));
+        assert!(pixels.as_chunks::<4>().0.iter().any(|p| p == &red.bgra));
+    }
+
+    #[test]
+    fn thickness_is_clamped() {
+        assert_eq!(Stroke::preset(4, 0).width, 1);
+        assert_eq!(Stroke::preset(3, u8::MAX).width, 9);
     }
 
 }
